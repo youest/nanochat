@@ -64,3 +64,34 @@ class TestMemoryStoreWrite:
         store.write(big_vec, surprise=5.0)
         stored = store.vectors[0]
         assert stored.norm().item() == pytest.approx(50.0, abs=0.1)  # clamped to max_vector_norm
+
+
+class TestMemoryStoreEviction:
+    def test_eviction_when_full(self):
+        """When full, the slot with lowest surprise is overwritten."""
+        cfg = CellMemConfig(enabled=True, n_slots=3)
+        store = MemoryStore(cfg, d_model=8)
+        store.write(torch.ones(8) * 1, surprise=2.0)  # slot 0, low surprise
+        store.write(torch.ones(8) * 2, surprise=8.0)  # slot 1, high surprise
+        store.write(torch.ones(8) * 3, surprise=5.0)  # slot 2, medium surprise
+        assert store.active_count == 3
+        # Write a 4th: should evict slot 0 (lowest surprise=2.0)
+        store.write(torch.ones(8) * 4, surprise=6.0)
+        assert store.active_count == 3  # still 3
+        assert store.surprise[0].item() == 6.0  # slot 0 was overwritten
+        assert store.vectors[0].allclose(torch.ones(8) * 4)
+
+    def test_all_slots_active_after_fill(self):
+        cfg = CellMemConfig(enabled=True, n_slots=2)
+        store = MemoryStore(cfg, d_model=4)
+        store.write(torch.randn(4), surprise=1.0)
+        store.write(torch.randn(4), surprise=2.0)
+        _, mask = store.read()
+        assert mask.all()  # all slots active when full
+
+    def test_age_increments(self):
+        cfg = CellMemConfig(enabled=True, n_slots=4)
+        store = MemoryStore(cfg, d_model=4)
+        store.write(torch.randn(4), surprise=5.0)
+        store.age_all(tokens_processed=100)
+        assert store.age[0].item() == 100
