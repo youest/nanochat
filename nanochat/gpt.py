@@ -79,7 +79,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, mem_kv=None, mem_gate=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -120,6 +120,19 @@ class CausalSelfAttention(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
+        # Cross-attention to memory (CellMem v2, Pass 2)
+        if mem_kv is not None and mem_gate is not None:
+            K_mem, V_mem = mem_kv
+            # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
+            q_sdpa = q.transpose(1, 2)
+            k_mem_sdpa = K_mem.transpose(1, 2)
+            v_mem_sdpa = V_mem.transpose(1, 2)
+            enable_gqa = q_sdpa.size(1) != k_mem_sdpa.size(1)
+            y_mem = F.scaled_dot_product_attention(q_sdpa, k_mem_sdpa, v_mem_sdpa,
+                                                    is_causal=False, enable_gqa=enable_gqa)
+            y_mem = y_mem.transpose(1, 2)  # back to (B, T, H, D)
+            y = y + mem_gate * y_mem
+
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -145,8 +158,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, mem_kv=None, mem_gate=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, mem_kv=mem_kv, mem_gate=mem_gate)
         x = x + self.mlp(norm(x))
         return x
 
