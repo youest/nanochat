@@ -184,6 +184,75 @@ class TestGPTWithCellMem:
         assert _cellmem_layer_indices(cfg) == []
 
 
+class TestGenerateWithMemory:
+    def test_generate_writes_memories(self, tmp_path):
+        from nanochat.gpt import GPT, GPTConfig
+        from nanochat.cellmem_v2 import CellMemConfig, MemoryStore
+
+        cellmem_cfg = CellMemConfig(enabled=True, n_slots=8, layers="last3",
+                                     surprise_threshold=0.5,  # low threshold to ensure writes
+                                     memory_dir=str(tmp_path))
+        cfg = GPTConfig(n_layer=4, n_head=2, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64, cellmem=cellmem_cfg)
+        model = GPT(cfg, pad_vocab_size_to=64)
+        model.init_weights()
+
+        # generate() should create MemoryStore, write memories, save to disk
+        tokens = list(range(8))
+        generated = list(model.generate(tokens, max_tokens=4))
+        assert len(generated) == 4
+        # Memory file should exist after generate
+        mem_path = tmp_path / "memory.pt"
+        assert mem_path.exists()
+
+    def test_generate_loads_existing_memory(self, tmp_path):
+        from nanochat.gpt import GPT, GPTConfig
+        from nanochat.cellmem_v2 import CellMemConfig, MemoryStore
+
+        cellmem_cfg = CellMemConfig(enabled=True, n_slots=8, layers="last3",
+                                     memory_dir=str(tmp_path))
+        cfg = GPTConfig(n_layer=4, n_head=2, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64, cellmem=cellmem_cfg)
+        model = GPT(cfg, pad_vocab_size_to=64)
+        model.init_weights()
+
+        # Pre-create a memory file
+        store = MemoryStore(cellmem_cfg, d_model=32)
+        store.write(torch.randn(32), surprise=5.0)
+        mem_path = tmp_path / "memory.pt"
+        store.save(mem_path)
+
+        # generate() should load it
+        tokens = list(range(8))
+        generated = list(model.generate(tokens, max_tokens=2))
+        assert len(generated) == 2
+        # model.memory_store should have the loaded memory + possibly new ones
+        assert model.memory_store is not None
+        assert model.memory_store.active_count >= 1
+
+    def test_generate_saves_on_early_exit(self, tmp_path):
+        """Memory is saved even if caller doesn't exhaust the generator (via try/finally)."""
+        from nanochat.gpt import GPT, GPTConfig
+        from nanochat.cellmem_v2 import CellMemConfig
+
+        cellmem_cfg = CellMemConfig(enabled=True, n_slots=8, layers="last3",
+                                     surprise_threshold=0.5,
+                                     memory_dir=str(tmp_path))
+        cfg = GPTConfig(n_layer=4, n_head=2, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64, cellmem=cellmem_cfg)
+        model = GPT(cfg, pad_vocab_size_to=64)
+        model.init_weights()
+
+        # Only consume 1 token from the generator, then close it
+        gen = model.generate(list(range(8)), max_tokens=10)
+        first_token = next(gen)
+        gen.close()  # This triggers GeneratorExit -> finally block
+
+        # Memory should still be saved
+        mem_path = tmp_path / "memory.pt"
+        assert mem_path.exists()
+
+
 class TestGPTCellMemDisabled:
     def test_no_mem_gates_when_disabled(self):
         from nanochat.gpt import GPT, GPTConfig
@@ -206,3 +275,43 @@ class TestGPTCellMemDisabled:
         loss = model(idx, targets=targets)
         assert loss.dim() == 0
         assert not torch.isnan(loss)
+
+
+class TestEndToEnd:
+    def test_memory_lifecycle(self, tmp_path):
+        """Full lifecycle: create model -> write memory -> save -> load into fresh store -> forward with memory -> verify no NaN."""
+        from nanochat.gpt import GPT, GPTConfig
+        from nanochat.cellmem_v2 import CellMemConfig, MemoryStore
+
+        cellmem_cfg = CellMemConfig(enabled=True, n_slots=8, layers="last3",
+                                     surprise_threshold=0.0)
+        cfg = GPTConfig(n_layer=4, n_head=2, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64, cellmem=cellmem_cfg)
+        model = GPT(cfg, pad_vocab_size_to=64)
+        model.init_weights()
+        model.eval()
+
+        store = MemoryStore(cellmem_cfg, d_model=32)
+        model.memory_store = store
+
+        # Session 1: write a memory
+        idx = torch.randint(0, 64, (1, 8))
+        with torch.no_grad():
+            logits1 = model(idx)
+        store.write(torch.randn(32), surprise=5.0)
+        assert store.active_count == 1
+
+        # Save
+        save_path = tmp_path / "memory.pt"
+        store.save(save_path)
+
+        # Session 2: load and use
+        store2 = MemoryStore(cellmem_cfg, d_model=32)
+        store2.load(save_path)
+        model.memory_store = store2
+        assert store2.active_count == 1
+
+        with torch.no_grad():
+            logits2 = model(idx)
+        assert logits2.shape == (1, 8, 64)
+        assert not torch.isnan(logits2).any()
