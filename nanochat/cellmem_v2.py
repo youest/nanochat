@@ -81,3 +81,47 @@ class MemoryStore:
         """Increment age of all active memories."""
         if self.active_count > 0:
             self.age[:self.active_count] += tokens_processed
+
+    @torch.compiler.disable
+    def save(self, path):
+        """Save memory state to .pt file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "vectors": self.vectors.clone(),
+            "surprise": self.surprise.clone(),
+            "age": self.age.clone(),
+            "write_ptr": self.write_ptr,
+            "active_count": self.active_count,
+            "config": asdict(self.config),
+            "version": 2,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        torch.save(data, path)
+
+    @torch.compiler.disable
+    def load(self, path):
+        """Load memory state from .pt file and apply decay."""
+        path = Path(path)
+        data = torch.load(path, weights_only=False)
+        self.vectors = data["vectors"]
+        self.surprise = data["surprise"]
+        self.age = data["age"]
+        self.write_ptr = data["write_ptr"]
+        self.active_count = data["active_count"]
+        # Apply decay
+        if self.active_count > 0:
+            self.vectors *= self.config.decay_factor
+
+    @torch.compiler.disable
+    def snapshot(self):
+        """Save timestamped backup. Keep only max_snapshots most recent."""
+        mem_dir = Path(self.config.memory_dir).expanduser()
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        snap_path = mem_dir / f"snapshot_{ts}.pt"
+        self.save(snap_path)
+        # Cleanup old snapshots
+        snaps = sorted(mem_dir.glob("snapshot_*.pt"))
+        while len(snaps) > self.config.max_snapshots:
+            snaps.pop(0).unlink()

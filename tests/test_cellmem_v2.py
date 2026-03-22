@@ -95,3 +95,60 @@ class TestMemoryStoreEviction:
         store.write(torch.randn(4), surprise=5.0)
         store.age_all(tokens_processed=100)
         assert store.age[0].item() == 100
+
+
+class TestPersistence:
+    def test_save_and_load(self, tmp_path):
+        cfg = CellMemConfig(enabled=True, n_slots=4, decay_factor=1.0)
+        store = MemoryStore(cfg, d_model=8)
+        vec = torch.randn(8)
+        store.write(vec, surprise=5.0)
+        save_path = tmp_path / "memory.pt"
+        store.save(save_path)
+        assert save_path.exists()
+        store2 = MemoryStore(cfg, d_model=8)
+        store2.load(save_path)
+        assert store2.active_count == 1
+        assert store2.vectors[0].allclose(vec, atol=1e-4)
+
+    def test_load_applies_decay(self, tmp_path):
+        cfg = CellMemConfig(enabled=True, n_slots=4, decay_factor=0.5)
+        store = MemoryStore(cfg, d_model=8)
+        vec = torch.ones(8)
+        store.write(vec, surprise=5.0)
+        save_path = tmp_path / "memory.pt"
+        store.save(save_path)
+        store2 = MemoryStore(cfg, d_model=8)
+        store2.load(save_path)
+        expected = vec * 0.5
+        assert store2.vectors[0].allclose(expected, atol=1e-6)
+
+    def test_snapshot_creates_timestamped_file(self, tmp_path):
+        cfg = CellMemConfig(enabled=True, n_slots=4, memory_dir=str(tmp_path))
+        store = MemoryStore(cfg, d_model=8)
+        store.write(torch.randn(8), surprise=5.0)
+        store.snapshot()
+        snaps = list(tmp_path.glob("snapshot_*.pt"))
+        assert len(snaps) == 1
+
+    def test_snapshot_max_retention(self, tmp_path):
+        import time
+        cfg = CellMemConfig(enabled=True, n_slots=4, max_snapshots=2, memory_dir=str(tmp_path))
+        store = MemoryStore(cfg, d_model=8)
+        store.write(torch.randn(8), surprise=5.0)
+        for _ in range(4):
+            store.snapshot()
+            time.sleep(0.002)  # ensure unique timestamps
+        snaps = sorted(tmp_path.glob("snapshot_*.pt"))
+        assert len(snaps) == 2  # only 2 retained
+
+    def test_save_format_version(self, tmp_path):
+        cfg = CellMemConfig(enabled=True, n_slots=4)
+        store = MemoryStore(cfg, d_model=8)
+        store.write(torch.randn(8), surprise=5.0)
+        save_path = tmp_path / "memory.pt"
+        store.save(save_path)
+        data = torch.load(save_path, weights_only=False)
+        assert data["version"] == 2
+        assert "saved_at" in data
+        assert "config" in data
