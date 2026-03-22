@@ -152,3 +152,53 @@ class TestPersistence:
         assert data["version"] == 2
         assert "saved_at" in data
         assert "config" in data
+
+
+class TestSurpriseCalculator:
+    def test_per_token_computes_loss(self):
+        from nanochat.cellmem_v2 import SurpriseCalculator
+        cfg = CellMemConfig(enabled=True, surprise_threshold=2.0, write_strategy="per_token")
+        calc = SurpriseCalculator(cfg)
+        logits = torch.zeros(1, 4, 8)
+        logits[0, :, 0] = 10.0  # strongly predict token 0
+        targets = torch.tensor([[0, 0, 5, 0]])  # token at pos 2 is surprising
+        surprises = calc.compute_surprise(logits, targets)
+        assert surprises.shape == (1, 4)
+        assert surprises[0, 2] > surprises[0, 0]
+
+    def test_per_token_threshold_filter(self):
+        from nanochat.cellmem_v2 import SurpriseCalculator
+        cfg = CellMemConfig(enabled=True, surprise_threshold=2.0, write_strategy="per_token")
+        calc = SurpriseCalculator(cfg)
+        logits = torch.zeros(1, 4, 8)
+        logits[0, :, 0] = 10.0
+        targets = torch.tensor([[0, 0, 5, 0]])
+        surprises = calc.compute_surprise(logits, targets)
+        write_mask = calc.get_write_mask(surprises)
+        assert write_mask.shape == (1, 4)
+        assert write_mask[0, 2].item() is True
+        assert write_mask[0, 0].item() is False
+
+    def test_chunk_strategy_averages(self):
+        from nanochat.cellmem_v2 import SurpriseCalculator
+        cfg = CellMemConfig(enabled=True, surprise_threshold=2.0,
+                           write_strategy="chunk", chunk_size=2)
+        calc = SurpriseCalculator(cfg)
+        logits = torch.zeros(1, 4, 8)
+        logits[0, :, 0] = 10.0
+        targets = torch.tensor([[5, 5, 0, 0]])  # first chunk surprising, second not
+        surprises = calc.compute_surprise(logits, targets)
+        chunks = calc.get_chunk_surprises(surprises)
+        assert len(chunks) == 2
+        assert chunks[0]["mean_surprise"] > chunks[1]["mean_surprise"]
+
+    def test_deduplication_tracking(self):
+        from nanochat.cellmem_v2 import SurpriseCalculator
+        cfg = CellMemConfig(enabled=True, surprise_threshold=0.0, write_strategy="per_token")
+        calc = SurpriseCalculator(cfg)
+        logits = torch.zeros(1, 4, 8)
+        targets = torch.zeros(1, 4, dtype=torch.long)
+        surprises = calc.compute_surprise(logits, targets)
+        mask1 = calc.get_write_mask(surprises, last_written_pos=1)
+        assert mask1[0, 0].item() is False
+        assert mask1[0, 1].item() is False

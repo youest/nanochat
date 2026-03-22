@@ -11,6 +11,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 
 
 @dataclass
@@ -125,3 +126,51 @@ class MemoryStore:
         snaps = sorted(mem_dir.glob("snapshot_*.pt"))
         while len(snaps) > self.config.max_snapshots:
             snaps.pop(0).unlink()
+
+
+class SurpriseCalculator:
+    """Computes per-token prediction error for memory write decisions."""
+
+    def __init__(self, config: CellMemConfig):
+        self.config = config
+
+    def compute_surprise(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute per-token surprise (cross-entropy loss).
+        Args:
+            logits: [B, T, V] model predictions
+            targets: [B, T] actual token ids
+        Returns:
+            surprises: [B, T] per-token loss values
+        """
+        B, T, V = logits.shape
+        loss = F.cross_entropy(
+            logits.view(B * T, V),
+            targets.view(B * T),
+            reduction='none'
+        )
+        return loss.view(B, T)
+
+    def get_write_mask(self, surprises: torch.Tensor, last_written_pos: int = -1) -> torch.Tensor:
+        """Return boolean mask of positions exceeding surprise threshold.
+        Positions <= last_written_pos are excluded (deduplication)."""
+        mask = surprises > self.config.surprise_threshold
+        if last_written_pos >= 0:
+            B, T = mask.shape
+            pos_mask = torch.arange(T, device=mask.device) > last_written_pos
+            mask = mask & pos_mask.unsqueeze(0)
+        return mask
+
+    def get_chunk_surprises(self, surprises: torch.Tensor):
+        """Split surprises into chunks, return list of chunk info dicts."""
+        B, T = surprises.shape
+        chunk_size = self.config.chunk_size
+        chunks = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            chunk_surprise = surprises[:, start:end].mean().item()
+            chunks.append({
+                "start": start,
+                "end": end,
+                "mean_surprise": chunk_surprise,
+            })
+        return chunks
