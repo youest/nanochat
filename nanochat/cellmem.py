@@ -121,3 +121,90 @@ class CellMem(nn.Module):
         r_add = torch.cat(out_add, dim=-1)
         x0_mod = torch.cat(out_x0, dim=-1)
         return g_attn, g_mlp, r_add, x0_mod
+
+    def forward_chunked(self, x_seq, chunk_size=32):
+        """Process a sequence (B, T, d_model) with M updated per chunk, not per token.
+        Each chunk of chunk_size tokens shares the same M for the forward pass,
+        then M is updated once using the chunk's mean error."""
+        B, T, d_model = x_seq.shape
+        n_cells = self.config.n_cells
+        d_slice = d_model // n_cells
+
+        all_attn, all_mlp, all_add, all_x0 = [], [], [], []
+
+        for t0 in range(0, T, chunk_size):
+            t1 = min(t0 + chunk_size, T)
+            chunk = x_seq[:, t0:t1, :]  # (B, chunk_len, d_model)
+            chunk_len = t1 - t0
+
+            chunk_attn, chunk_mlp, chunk_add, chunk_x0 = [], [], [], []
+
+            for i in range(n_cells):
+                x_slice = chunk[:, :, i * d_slice:(i + 1) * d_slice]  # (B, chunk_len, d_slice)
+                x_flat = x_slice.reshape(B * chunk_len, d_slice)
+
+                # 1. Project to cell space
+                z = x_flat @ self.W_in[i]  # (B*chunk_len, d_cell)
+
+                # 2. Memory prediction with current M
+                M, T_mask = self._M[i], self._T[i]
+                z_pred = ((M * T_mask) @ z.T).T  # (B*chunk_len, d_cell)
+
+                # 3. Error and novelty
+                error = z - z_pred
+                z_norm_sq = z.norm(dim=-1, keepdim=True) ** 2 + 1e-8
+                novelty = (error.norm(dim=-1, keepdim=True) ** 2) / z_norm_sq
+                self._novelty[i] = novelty.mean().detach()
+
+                # 4. Astrocyte modulation (on chunk stats)
+                z_norms = z.norm(dim=-1)
+                mu = self._astro_mu[i]
+                sigma = self._astro_sigma[i]
+                mu = 0.99 * mu + 0.01 * z_norms.mean().detach()
+                sigma = 0.99 * sigma + 0.01 * ((z_norms.detach() - mu) ** 2).mean()
+                self._astro_mu[i] = mu
+                self._astro_sigma[i] = sigma
+                alpha_eff = self.alpha_base[i] * (sigma / (mu + 1e-8))
+
+                # 5. Anti-Hebbian update: ONE update using chunk mean
+                delta_M = alpha_eff * (error.unsqueeze(-1) * z.unsqueeze(-2)).mean(dim=0)
+                self._M[i] = M + delta_M
+
+                # 6. Topology update (detached)
+                error_d = error.detach()
+                z_d = z.detach()
+                gamma_val = self.gamma[i].detach()
+                tau_val = self.tau[i].detach()
+                delta_T = gamma_val * (
+                    (error_d.abs().unsqueeze(-1) * z_d.abs().unsqueeze(-2)).mean(dim=0)
+                    - tau_val * T_mask
+                )
+                self._T[i] = (T_mask + delta_T).clamp(0, 1)
+
+                # 7. MSB fan-out
+                mem_out = ((self._M[i] * self._T[i]) @ z.T).T  # (B*chunk_len, d_cell)
+                chunk_attn.append((mem_out @ self.W_msb[i][0]).reshape(B, chunk_len, d_slice))
+                chunk_mlp.append((mem_out @ self.W_msb[i][1]).reshape(B, chunk_len, d_slice))
+                chunk_add.append((mem_out @ self.W_msb[i][2]).reshape(B, chunk_len, d_slice))
+                chunk_x0.append((mem_out @ self.W_msb[i][3]).reshape(B, chunk_len, d_slice))
+
+            all_attn.append(torch.cat(chunk_attn, dim=-1))
+            all_mlp.append(torch.cat(chunk_mlp, dim=-1))
+            all_add.append(torch.cat(chunk_add, dim=-1))
+            all_x0.append(torch.cat(chunk_x0, dim=-1))
+
+        return (torch.cat(all_attn, dim=1), torch.cat(all_mlp, dim=1),
+                torch.cat(all_add, dim=1), torch.cat(all_x0, dim=1))
+
+    def apply_decay(self, factor: float = 0.999):
+        """Decay M by a factor. Call between invocations to prevent explosion.
+        M = factor * M. The identity component (0.01*I) is NOT restored —
+        this means very old, unreinforced patterns eventually vanish."""
+        for i in range(self.config.n_cells):
+            self._M[i] = factor * self._M[i]
+
+    def get_mean_novelty(self) -> float:
+        """Return mean novelty across all cells. Used by MemoryBank to gate writes."""
+        if self._novelty is None:
+            return 0.0
+        return sum(n.item() for n in self._novelty) / len(self._novelty)

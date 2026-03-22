@@ -64,6 +64,9 @@ cpu = [
 gpu = [
     "torch==2.9.1",
 ]
+memory = [
+    "faiss-cpu>=1.7.0",
+]
 
 [tool.uv]
 conflicts = [

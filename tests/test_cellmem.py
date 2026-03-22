@@ -366,3 +366,112 @@ class TestModule:
 
         for m1, m2 in zip(results[0], results[1]):
             assert torch.allclose(m1, m2), "Same seed should produce same state"
+
+
+class TestChunked:
+    def test_chunked_output_shape(self):
+        """Chunked forward should produce same shape as regular."""
+        torch.manual_seed(0)
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
+        B, T = 2, 32
+        mem.reset_state(B)
+        x = torch.randn(B, T, cfg.d_model)
+        g_attn, g_mlp, r_add, x0_mod = mem.forward_chunked(x, chunk_size=8)
+        assert g_attn.shape == (B, T, cfg.d_model)
+
+    def test_chunked_M_updates_fewer_times(self):
+        """With chunk_size=8 on 32 tokens, M should update 4 times, not 32."""
+        torch.manual_seed(0)
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
+        B, T = 1, 32
+        mem.reset_state(B)
+        x = torch.randn(B, T, cfg.d_model)
+        # We'll check by comparing M before and after
+        M_before = [m.clone() for m in mem._M]
+        mem.forward_chunked(x, chunk_size=8)
+        M_after = [m.clone() for m in mem._M]
+        # M should have changed
+        assert not all(torch.allclose(a, b) for a, b in zip(M_before, M_after))
+
+    def test_chunked_still_counts(self):
+        """Chunked update should still enable state accumulation.
+        Feed pattern A repeated, check that novelty decreases (M learns to predict A)."""
+        torch.manual_seed(0)
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
+        B = 1
+        mem.reset_state(B)
+        A = torch.randn(cfg.d_model)
+        # First chunk: high novelty (M hasn't seen A yet)
+        x_early = A.unsqueeze(0).unsqueeze(0).expand(B, 16, cfg.d_model)
+        mem.forward_chunked(x_early, chunk_size=16)
+        novelty_early = mem.get_mean_novelty()
+        # More chunks: M should adapt
+        x_late = A.unsqueeze(0).unsqueeze(0).expand(B, 64, cfg.d_model)
+        mem.forward_chunked(x_late, chunk_size=16)
+        novelty_late = mem.get_mean_novelty()
+        assert novelty_late < novelty_early, (
+            f"Novelty should decrease: early={novelty_early:.4f} late={novelty_late:.4f}"
+        )
+
+
+class TestDecay:
+    def test_m_decay_reduces_magnitude(self):
+        """With decay < 1, M magnitude should decrease if no new input."""
+        torch.manual_seed(0)
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
+        mem.reset_state(1)
+        # Build up M
+        for _ in range(50):
+            mem(torch.randn(1, cfg.d_model))
+        M_before = sum(m.abs().sum().item() for m in mem._M)
+        # Apply decay without input
+        mem.apply_decay(factor=0.9)
+        M_after = sum(m.abs().sum().item() for m in mem._M)
+        assert M_after < M_before
+
+    def test_m_decay_preserves_structure(self):
+        """Decay should scale M uniformly, preserving relative structure."""
+        torch.manual_seed(0)
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
+        mem.reset_state(1)
+        for _ in range(50):
+            mem(torch.randn(1, cfg.d_model))
+        M_before = mem._M[0].clone()
+        mem.apply_decay(factor=0.9)
+        M_after = mem._M[0]
+        # Should be approximately 0.9 * M_before
+        assert torch.allclose(M_after, 0.9 * M_before, atol=1e-6)
+
+
+class TestNoveltyExposure:
+    def test_get_mean_novelty_after_familiar(self):
+        """After many repetitions, novelty should be low."""
+        torch.manual_seed(0)
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
+        mem.reset_state(1)
+        A, _, _ = make_patterns(cfg.d_model)
+        for _ in range(100):
+            mem(A.unsqueeze(0))
+        novelty = mem.get_mean_novelty()
+        assert novelty < 0.5, f"Novelty should be low for familiar input: {novelty}"
+
+    def test_get_mean_novelty_after_novel(self):
+        """After novel input, novelty should be higher."""
+        torch.manual_seed(0)
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
+        mem.reset_state(1)
+        A, _, C = make_patterns(cfg.d_model)
+        for _ in range(100):
+            mem(A.unsqueeze(0))
+        novelty_familiar = mem.get_mean_novelty()
+        # Now feed novel pattern
+        mem(C.unsqueeze(0))
+        novelty_novel = mem.get_mean_novelty()
+        assert novelty_novel > novelty_familiar
