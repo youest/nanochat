@@ -391,7 +391,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        cellmem = sum(p.numel() for p in self.cellmems.parameters())
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + cellmem
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -399,6 +400,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'cellmem': cellmem,
             'total': total,
         }
 
@@ -442,10 +444,12 @@ class GPT(nn.Module):
         ]
         if cellmem_scalar_params:
             param_groups.append(dict(kind='adamw', params=cellmem_scalar_params, lr=scalar_lr * 0.1, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
+        # CellMem matrices: AdamW (separate from Muon to avoid None-grad stacking issues)
+        if cellmem_matrix_params:
+            param_groups.append(dict(kind='adamw', params=cellmem_matrix_params, lr=matrix_lr * dmodel_lr_scale, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.01))
         # Muon groups (matrix params, grouped by shape for stacking)
-        all_matrix_params = matrix_params + cellmem_matrix_params
-        for shape in sorted({p.shape for p in all_matrix_params}):
-            group_params = [p for p in all_matrix_params if p.shape == shape]
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,

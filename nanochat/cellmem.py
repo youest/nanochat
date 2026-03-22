@@ -61,6 +61,7 @@ class CellMem(nn.Module):
             "novelty": [n.detach().clone() for n in self._novelty],
         }
 
+    @torch.compiler.disable
     def forward(self, x):
         B, d_model = x.shape
         dt = x.dtype
@@ -124,6 +125,7 @@ class CellMem(nn.Module):
         x0_mod = torch.cat(out_x0, dim=-1)
         return g_attn, g_mlp, r_add, x0_mod
 
+    @torch.compiler.disable
     def forward_chunked(self, x_seq, chunk_size=32):
         """Process a sequence (B, T, d_model) with M updated per chunk, not per token.
         Each chunk of chunk_size tokens shares the same M for the forward pass,
