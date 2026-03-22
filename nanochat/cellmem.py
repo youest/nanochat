@@ -13,7 +13,7 @@ class CellMemConfig:
     d_model: int = 768
     d_cell: int = 32
     n_cells: int = 2
-    alpha_init: float = 0.01
+    alpha_init: float = 0.1
     gamma_init: float = 0.01
     tau_init: float = 0.01
 
@@ -26,10 +26,10 @@ class CellMem(nn.Module):
         assert d_model % n_cells == 0
         d_slice = d_model // n_cells
 
-        # Per-cell learnable parameters
-        self.W_in = nn.ParameterList([nn.Parameter(torch.randn(d_slice, d_cell) * 0.02) for _ in range(n_cells)])
+        # Per-cell learnable parameters (Xavier init for proper signal magnitude)
+        self.W_in = nn.ParameterList([nn.Parameter(torch.randn(d_slice, d_cell) / d_slice**0.5) for _ in range(n_cells)])
         self.W_msb = nn.ModuleList([
-            nn.ParameterList([nn.Parameter(torch.randn(d_cell, d_slice) * 0.02) for _ in range(4)])
+            nn.ParameterList([nn.Parameter(torch.randn(d_cell, d_slice) / d_cell**0.5) for _ in range(4)])
             for _ in range(n_cells)
         ])
         self.alpha_base = nn.ParameterList([nn.Parameter(torch.tensor(config.alpha_init)) for _ in range(n_cells)])
@@ -45,10 +45,10 @@ class CellMem(nn.Module):
 
     def reset_state(self, batch_size: int):
         d_cell, n_cells = self.config.d_cell, self.config.n_cells
-        self._M = [torch.zeros(d_cell, d_cell) for _ in range(n_cells)]
+        self._M = [0.01 * torch.eye(d_cell) for _ in range(n_cells)]
         self._T = [torch.ones(d_cell, d_cell) for _ in range(n_cells)]
-        self._astro_mu = [torch.zeros(1) for _ in range(n_cells)]
-        self._astro_sigma = [torch.zeros(1) for _ in range(n_cells)]
+        self._astro_mu = [torch.ones(1) for _ in range(n_cells)]
+        self._astro_sigma = [torch.ones(1) for _ in range(n_cells)]
         self._novelty = [torch.zeros(1) for _ in range(n_cells)]
 
     def get_state(self):
@@ -94,13 +94,13 @@ class CellMem(nn.Module):
             self._astro_sigma[i] = sigma
             alpha_eff = self.alpha_base[i] * (sigma / (mu + 1e-8))
 
-            # 5. Anti-Hebbian memory update (detached from autograd)
-            error_d = error.detach()
-            z_d = z.detach()
-            delta_M = alpha_eff.detach() * (error_d.unsqueeze(-1) * z_d.unsqueeze(-2)).mean(dim=0)
+            # 5. Anti-Hebbian memory update (differentiable — gradients flow through M chain)
+            delta_M = alpha_eff * (error.unsqueeze(-1) * z.unsqueeze(-2)).mean(dim=0)
             self._M[i] = M + delta_M
 
-            # 6. Topology update (detached)
+            # 6. Topology update (detached — T is a structural mask, not a smooth function)
+            error_d = error.detach()
+            z_d = z.detach()
             gamma_val = self.gamma[i].detach()
             tau_val = self.tau[i].detach()
             delta_T = gamma_val * (

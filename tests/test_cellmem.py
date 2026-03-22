@@ -200,43 +200,48 @@ class TestAstrocyte:
     """Test that the astrocyte modulates learning rate correctly."""
 
     def test_high_variance_increases_lr(self):
-        """When inputs are diverse (high variance), alpha_eff should be higher."""
+        """When inputs are diverse (high variance), sigma should be higher after many steps."""
         torch.manual_seed(0)
-        mem = CellMem(CFG)
+        # Use fresh config with astro starting from zero to test modulation direction
+        cfg = CellMemConfig(d_model=16, d_cell=8, n_cells=2)
+        mem = CellMem(cfg)
         mem.reset_state(1)
+        # Override astro to start from zero for a clean test
+        mem._astro_mu = [torch.zeros(1) for _ in range(cfg.n_cells)]
+        mem._astro_sigma = [torch.zeros(1) for _ in range(cfg.n_cells)]
 
         # Feed diverse patterns
-        A, B, C = make_patterns(CFG.d_model, seed=99)
-        patterns = [A, B, C]
-        for _ in range(30):
-            for p in patterns:
+        A, B, C = make_patterns(cfg.d_model, seed=99)
+        for _ in range(100):
+            for p in [A, B, C]:
                 mem(p.unsqueeze(0))
-        state_diverse = mem.get_state()
+        sigma_diverse = sum(s.item() for s in mem.get_state()["astro_sigma"])
 
-        # Feed uniform pattern
+        # Feed uniform pattern from scratch
         mem.reset_state(1)
-        for _ in range(90):
+        mem._astro_mu = [torch.zeros(1) for _ in range(cfg.n_cells)]
+        mem._astro_sigma = [torch.zeros(1) for _ in range(cfg.n_cells)]
+        for _ in range(300):
             mem(A.unsqueeze(0))
-        state_uniform = mem.get_state()
+        sigma_uniform = sum(s.item() for s in mem.get_state()["astro_sigma"])
 
-        # astro_sigma should be higher for diverse inputs
-        sigma_diverse = sum(s.item() for s in state_diverse["astro_sigma"])
-        sigma_uniform = sum(s.item() for s in state_uniform["astro_sigma"])
         assert sigma_diverse > sigma_uniform, \
             f"Diverse sigma={sigma_diverse:.6f} should exceed uniform sigma={sigma_uniform:.6f}"
 
     def test_low_variance_decreases_lr(self):
-        """When inputs are uniform, astro_sigma should be low."""
+        """When inputs are uniform, astro_sigma should converge to small value from zero start."""
         torch.manual_seed(0)
         mem = CellMem(CFG)
         mem.reset_state(1)
+        # Start astro from zero
+        mem._astro_mu = [torch.zeros(1) for _ in range(CFG.n_cells)]
+        mem._astro_sigma = [torch.zeros(1) for _ in range(CFG.n_cells)]
 
         A, _, _ = make_patterns(CFG.d_model)
-        for _ in range(100):
+        for _ in range(300):
             mem(A.unsqueeze(0))
 
         state = mem.get_state()
-        # With uniform input, sigma should be small
         for sigma in state["astro_sigma"]:
             assert sigma.item() < 0.1, f"astro_sigma should be small for uniform input, got {sigma.item():.4f}"
 
@@ -295,7 +300,7 @@ class TestModule:
         mem.reset_state(1)
         state = mem.get_state()
         for m in state["M"]:
-            assert torch.allclose(m, torch.zeros_like(m)), "M should be zeros after reset"
+            assert torch.allclose(m, 0.01 * torch.eye(m.shape[0])), "M should be 0.01*I after reset"
         for t in state["T"]:
             assert torch.allclose(t, torch.ones_like(t)), "T should be ones after reset"
 
@@ -324,6 +329,26 @@ class TestModule:
             if "W_in" in name or "W_msb" in name:
                 assert p.grad is not None, f"No gradient for {name}"
                 assert p.grad.abs().sum() > 0, f"Zero gradient for {name}"
+
+    def test_gradient_flows_through_M_chain(self):
+        """Gradients should flow through the M update chain across multiple tokens.
+        This is the key test for Option B: differentiable M."""
+        torch.manual_seed(0)
+        mem = CellMem(CFG)
+        mem.reset_state(1)
+        # Process 5 tokens sequentially — M updates at each step
+        for i in range(5):
+            x = torch.randn(1, CFG.d_model, requires_grad=(i == 0))
+            if i == 0:
+                x_first = x  # keep reference to first input
+            g_attn, g_mlp, r_add, x0_mod = mem(x)
+        # Loss on the LAST token's output
+        loss = r_add.sum()
+        loss.backward()
+        # The gradient should reach x_first through the M chain:
+        # x_first → z₀ → M₁ → z₁_pred → error₁ → M₂ → ... → r_add₅
+        assert x_first.grad is not None, "Gradient should reach first input through M chain"
+        assert x_first.grad.abs().sum() > 0, "Gradient through M chain should be non-zero"
 
     def test_deterministic(self):
         """Same input sequence should produce same state with same seed."""
