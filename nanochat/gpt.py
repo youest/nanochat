@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.cellmem_v2 import CellMemConfig
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -37,6 +38,30 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # CellMem v2: persistent inference-time memory
+    cellmem: CellMemConfig = None
+
+    def __post_init__(self):
+        if self.cellmem is None:
+            self.cellmem = CellMemConfig()
+        elif isinstance(self.cellmem, dict):
+            # Handle deserialization from checkpoint (asdict converts dataclass to dict)
+            self.cellmem = CellMemConfig(**self.cellmem)
+
+
+def _cellmem_layer_indices(config):
+    """Return list of layer indices that should have memory cross-attention."""
+    if not config.cellmem.enabled:
+        return []
+    n = config.n_layer
+    s = config.cellmem.layers
+    if s == "last3":
+        return list(range(max(0, n - 3), n))
+    elif s == "mid":
+        return [n // 2]
+    elif s == "all":
+        return list(range(n))
+    raise ValueError(f"Unknown cellmem.layers: {s}")
 
 
 def norm(x):
@@ -201,6 +226,16 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # CellMem v2: per-layer gates for memory cross-attention
+        self._cellmem_layers = _cellmem_layer_indices(config)
+        if config.cellmem.enabled and self._cellmem_layers:
+            self.mem_gates = nn.ParameterList([
+                nn.Parameter(torch.zeros(1)) for _ in self._cellmem_layers
+            ])
+            self.memory_store = None  # created at inference, not nn.Module
+        else:
+            self.mem_gates = None
+            self.memory_store = None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -259,6 +294,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # CellMem v2: init gates to -10 so sigmoid near 0
+        if self.mem_gates is not None:
+            for gate in self.mem_gates:
+                gate.data.fill_(-10.0)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -337,9 +377,11 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        cellmem_gates_numel = sum(p.numel() for p in self.mem_gates) if self.mem_gates is not None else 0
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+                          self.smear_gate.weight.numel() + self.smear_lambda.numel() +
+                          self.backout_lambda.numel() + cellmem_gates_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -368,7 +410,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        cellmem_gates = sum(p.numel() for p in self.mem_gates) if self.mem_gates is not None else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + cellmem_gates
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -376,6 +419,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'cellmem_gates': cellmem_gates,
             'total': total,
         }
 
@@ -391,7 +435,10 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        cellmem_params = list(self.mem_gates) if self.mem_gates is not None else []
+        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) +
+            len(x0_params) + len(smear_params) + len(cellmem_params))
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -407,6 +454,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if cellmem_params:
+            param_groups.append(dict(kind='adamw', params=cellmem_params,
+                                    lr=scalar_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -456,6 +506,25 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
+        # CellMem v2: prepare memory K/V for selected layers (inference only)
+        mem_kvs = {}
+        if (not self.training and self.mem_gates is not None
+                and self.memory_store is not None):
+            mem_read = self.memory_store.read()
+            if mem_read is not None:
+                mem_vectors, mem_mask = mem_read
+                mem_active = mem_vectors[mem_mask].unsqueeze(0).to(x.dtype).to(x.device)
+                for gate_idx, layer_idx in enumerate(self._cellmem_layers):
+                    block = self.transformer.h[layer_idx]
+                    attn = block.attn
+                    K_m = attn.c_k(mem_active).view(1, -1, attn.n_kv_head, attn.head_dim)
+                    V_m = attn.c_v(mem_active).view(1, -1, attn.n_kv_head, attn.head_dim)
+                    K_m = norm(K_m) * 1.2  # QK-norm + scaling, no RoPE
+                    K_m = K_m.expand(B, -1, -1, -1)
+                    V_m = V_m.expand(B, -1, -1, -1)
+                    gate = torch.sigmoid(self.mem_gates[gate_idx])
+                    mem_kvs[layer_idx] = ((K_m, V_m), gate)
+
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
@@ -464,7 +533,13 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            mem_info = mem_kvs.get(i)
+            if mem_info is not None:
+                mem_kv, mem_gate = mem_info
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache,
+                          mem_kv=mem_kv, mem_gate=mem_gate)
+            else:
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

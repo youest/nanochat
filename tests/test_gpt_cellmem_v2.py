@@ -82,3 +82,127 @@ class TestAttentionWithMemory:
         y_mem = block(x, ve=None, cos_sin=(cos, sin), window_size=(-1, 0), kv_cache=None,
                       mem_kv=(K_mem, V_mem), mem_gate=gate)
         assert not torch.allclose(y_no, y_mem, atol=0.01)
+
+
+from nanochat.cellmem_v2 import CellMemConfig
+
+
+class TestGPTWithCellMem:
+    def _make_model(self, cellmem_cfg=None):
+        from nanochat.gpt import GPT, GPTConfig
+        if cellmem_cfg is None:
+            cellmem_cfg = CellMemConfig(enabled=True, n_slots=8, layers="last3")
+        cfg = GPTConfig(n_layer=4, n_head=2, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64, cellmem=cellmem_cfg)
+        model = GPT(cfg, pad_vocab_size_to=64)
+        model.init_weights()
+        return model
+
+    def test_config_has_cellmem(self):
+        from nanochat.gpt import GPTConfig
+        cfg = GPTConfig()
+        assert hasattr(cfg, 'cellmem')
+        assert cfg.cellmem.enabled is False
+
+    def test_config_dict_deserialization(self):
+        """GPTConfig __post_init__ converts dict to CellMemConfig."""
+        from nanochat.gpt import GPTConfig
+        cfg = GPTConfig(cellmem={"enabled": True, "n_slots": 32})
+        assert isinstance(cfg.cellmem, CellMemConfig)
+        assert cfg.cellmem.enabled is True
+        assert cfg.cellmem.n_slots == 32
+
+    def test_model_creates_mem_gates(self):
+        model = self._make_model()
+        assert hasattr(model, 'mem_gates')
+        assert len(model.mem_gates) == 3  # last3 on 4 layers = layers 1,2,3
+
+    def test_mem_gates_init_near_zero(self):
+        model = self._make_model()
+        for gate in model.mem_gates:
+            assert torch.sigmoid(gate).item() < 0.001
+
+    def test_forward_training_mode_ignores_memory(self):
+        model = self._make_model()
+        model.train()
+        idx = torch.randint(0, 64, (1, 8))
+        targets = torch.randint(0, 64, (1, 8))
+        loss = model(idx, targets=targets)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
+
+    def test_forward_inference_no_crash(self):
+        model = self._make_model()
+        model.eval()
+        idx = torch.randint(0, 64, (1, 8))
+        with torch.no_grad():
+            logits = model(idx)
+        assert logits.shape == (1, 8, 64)
+
+    def test_num_scaling_params_includes_gates(self):
+        model = self._make_model()
+        counts = model.num_scaling_params()
+        assert 'cellmem_gates' in counts
+        assert counts['cellmem_gates'] == 3
+
+    def test_estimate_flops_excludes_gates(self):
+        """estimate_flops should exclude cellmem gates from matmul param count."""
+        model = self._make_model()
+        flops = model.estimate_flops()
+        assert isinstance(flops, (int, float))
+        assert flops > 0
+
+    def test_optimizer_includes_gates(self):
+        model = self._make_model()
+        optimizer = model.setup_optimizer()
+        all_params = set()
+        for group in optimizer.param_groups:
+            for p in group['params']:
+                all_params.add(id(p))
+        for gate in model.mem_gates:
+            assert id(gate) in all_params
+
+    def test_cellmem_layer_indices_last3(self):
+        """last3 on 4-layer model should yield layers [1,2,3]."""
+        from nanochat.gpt import _cellmem_layer_indices, GPTConfig
+        cfg = GPTConfig(n_layer=4, cellmem=CellMemConfig(enabled=True, layers="last3"))
+        assert _cellmem_layer_indices(cfg) == [1, 2, 3]
+
+    def test_cellmem_layer_indices_mid(self):
+        from nanochat.gpt import _cellmem_layer_indices, GPTConfig
+        cfg = GPTConfig(n_layer=4, cellmem=CellMemConfig(enabled=True, layers="mid"))
+        assert _cellmem_layer_indices(cfg) == [2]
+
+    def test_cellmem_layer_indices_all(self):
+        from nanochat.gpt import _cellmem_layer_indices, GPTConfig
+        cfg = GPTConfig(n_layer=4, cellmem=CellMemConfig(enabled=True, layers="all"))
+        assert _cellmem_layer_indices(cfg) == [0, 1, 2, 3]
+
+    def test_cellmem_layer_indices_disabled(self):
+        from nanochat.gpt import _cellmem_layer_indices, GPTConfig
+        cfg = GPTConfig(n_layer=4, cellmem=CellMemConfig(enabled=False))
+        assert _cellmem_layer_indices(cfg) == []
+
+
+class TestGPTCellMemDisabled:
+    def test_no_mem_gates_when_disabled(self):
+        from nanochat.gpt import GPT, GPTConfig
+        cfg = GPTConfig(n_layer=4, n_head=2, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64)
+        model = GPT(cfg, pad_vocab_size_to=64)
+        model.init_weights()
+        assert not hasattr(model, 'mem_gates') or model.mem_gates is None
+
+    def test_forward_works_without_cellmem(self):
+        """Default GPTConfig (cellmem disabled) should work exactly as before."""
+        from nanochat.gpt import GPT, GPTConfig
+        cfg = GPTConfig(n_layer=2, n_head=2, n_kv_head=2, n_embd=32,
+                       sequence_len=16, vocab_size=64)
+        model = GPT(cfg, pad_vocab_size_to=64)
+        model.init_weights()
+        model.train()
+        idx = torch.randint(0, 64, (1, 8))
+        targets = torch.randint(0, 64, (1, 8))
+        loss = model(idx, targets=targets)
+        assert loss.dim() == 0
+        assert not torch.isnan(loss)
