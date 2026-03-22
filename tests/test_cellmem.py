@@ -448,6 +448,34 @@ class TestDecay:
         assert torch.allclose(M_after, 0.9 * M_before, atol=1e-6)
 
 
+class TestDeviceAndDtype:
+    def test_reset_state_uses_param_device(self):
+        """State tensors should be on the same device as parameters."""
+        mem = CellMem(CFG)
+        mem.reset_state(1)
+        param_device = mem.W_in[0].device
+        for m in mem._M:
+            assert m.device == param_device
+        for t in mem._T:
+            assert t.device == param_device
+
+    def test_output_dtype_matches_input(self):
+        """Outputs should match input dtype."""
+        mem = CellMem(CFG)
+        mem.reset_state(1)
+        x = torch.randn(1, CFG.d_model, dtype=torch.bfloat16)
+        g_attn, g_mlp, r_add, x0_mod = mem(x)
+        assert g_attn.dtype == torch.bfloat16
+
+    def test_chunked_output_dtype_matches_input(self):
+        """Chunked outputs should match input dtype."""
+        mem = CellMem(CFG)
+        mem.reset_state(1)
+        x = torch.randn(1, 16, CFG.d_model, dtype=torch.bfloat16)
+        g_attn, g_mlp, r_add, x0_mod = mem.forward_chunked(x, chunk_size=8)
+        assert g_attn.dtype == torch.bfloat16
+
+
 class TestNoveltyExposure:
     def test_get_mean_novelty_after_familiar(self):
         """After many repetitions, novelty should be low."""

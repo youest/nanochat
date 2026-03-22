@@ -45,11 +45,12 @@ class CellMem(nn.Module):
 
     def reset_state(self, batch_size: int):
         d_cell, n_cells = self.config.d_cell, self.config.n_cells
-        self._M = [0.01 * torch.eye(d_cell) for _ in range(n_cells)]
-        self._T = [torch.ones(d_cell, d_cell) for _ in range(n_cells)]
-        self._astro_mu = [torch.ones(1) for _ in range(n_cells)]
-        self._astro_sigma = [torch.ones(1) for _ in range(n_cells)]
-        self._novelty = [torch.zeros(1) for _ in range(n_cells)]
+        device = self.W_in[0].device
+        self._M = [0.01 * torch.eye(d_cell, device=device) for _ in range(n_cells)]
+        self._T = [torch.ones(d_cell, d_cell, device=device) for _ in range(n_cells)]
+        self._astro_mu = [torch.ones(1, device=device) for _ in range(n_cells)]
+        self._astro_sigma = [torch.ones(1, device=device) for _ in range(n_cells)]
+        self._novelty = [torch.zeros(1, device=device) for _ in range(n_cells)]
 
     def get_state(self):
         return {
@@ -62,6 +63,7 @@ class CellMem(nn.Module):
 
     def forward(self, x):
         B, d_model = x.shape
+        dt = x.dtype
         n_cells = self.config.n_cells
         d_slice = d_model // n_cells
 
@@ -70,11 +72,11 @@ class CellMem(nn.Module):
         for i in range(n_cells):
             x_slice = x[:, i * d_slice:(i + 1) * d_slice]  # (B, d_slice)
 
-            # 1. Project input to cell space
-            z = x_slice @ self.W_in[i]  # (B, d_cell)
+            # 1. Project input to cell space (cast fp32 master weight to input dtype)
+            z = x_slice @ self.W_in[i].to(dtype=dt)  # (B, d_cell)
 
-            # 2. Memory prediction
-            M, T = self._M[i], self._T[i]
+            # 2. Memory prediction (M kept in input dtype)
+            M, T = self._M[i].to(dtype=dt), self._T[i].to(dtype=dt)
             z_pred = (M * T) @ z.T  # (d_cell, B)
             z_pred = z_pred.T  # (B, d_cell)
 
@@ -86,13 +88,13 @@ class CellMem(nn.Module):
 
             # 4. Astrocyte modulation
             z_norms = z.norm(dim=-1)  # (B,)
-            mu = self._astro_mu[i]
-            sigma = self._astro_sigma[i]
+            mu = self._astro_mu[i].to(dtype=dt)
+            sigma = self._astro_sigma[i].to(dtype=dt)
             mu = 0.99 * mu + 0.01 * z_norms.mean().detach()
             sigma = 0.99 * sigma + 0.01 * ((z_norms.detach() - mu) ** 2).mean()
             self._astro_mu[i] = mu
             self._astro_sigma[i] = sigma
-            alpha_eff = self.alpha_base[i] * (sigma / (mu + 1e-8))
+            alpha_eff = self.alpha_base[i].to(dtype=dt) * (sigma / (mu + 1e-8))
 
             # 5. Anti-Hebbian memory update (differentiable — gradients flow through M chain)
             delta_M = alpha_eff * (error.unsqueeze(-1) * z.unsqueeze(-2)).mean(dim=0)
@@ -101,20 +103,20 @@ class CellMem(nn.Module):
             # 6. Topology update (detached — T is a structural mask, not a smooth function)
             error_d = error.detach()
             z_d = z.detach()
-            gamma_val = self.gamma[i].detach()
-            tau_val = self.tau[i].detach()
+            gamma_val = self.gamma[i].detach().to(dtype=dt)
+            tau_val = self.tau[i].detach().to(dtype=dt)
             delta_T = gamma_val * (
                 (error_d.abs().unsqueeze(-1) * z_d.abs().unsqueeze(-2)).mean(dim=0) - tau_val * T
             )
             self._T[i] = (T + delta_T).clamp(0, 1)
 
-            # 7. MSB fan-out
+            # 7. MSB fan-out (cast fp32 master weights to input dtype)
             mem_out = (self._M[i] * self._T[i]) @ z.T  # (d_cell, B)
             mem_out = mem_out.T  # (B, d_cell)
-            out_attn.append(mem_out @ self.W_msb[i][0])   # (B, d_slice)
-            out_mlp.append(mem_out @ self.W_msb[i][1])     # (B, d_slice)
-            out_add.append(mem_out @ self.W_msb[i][2])     # (B, d_slice)
-            out_x0.append(mem_out @ self.W_msb[i][3])      # (B, d_slice)
+            out_attn.append(mem_out @ self.W_msb[i][0].to(dtype=dt))   # (B, d_slice)
+            out_mlp.append(mem_out @ self.W_msb[i][1].to(dtype=dt))     # (B, d_slice)
+            out_add.append(mem_out @ self.W_msb[i][2].to(dtype=dt))     # (B, d_slice)
+            out_x0.append(mem_out @ self.W_msb[i][3].to(dtype=dt))      # (B, d_slice)
 
         g_attn = torch.cat(out_attn, dim=-1)
         g_mlp = torch.cat(out_mlp, dim=-1)
@@ -127,6 +129,7 @@ class CellMem(nn.Module):
         Each chunk of chunk_size tokens shares the same M for the forward pass,
         then M is updated once using the chunk's mean error."""
         B, T, d_model = x_seq.shape
+        dt = x_seq.dtype
         n_cells = self.config.n_cells
         d_slice = d_model // n_cells
 
@@ -143,11 +146,11 @@ class CellMem(nn.Module):
                 x_slice = chunk[:, :, i * d_slice:(i + 1) * d_slice]  # (B, chunk_len, d_slice)
                 x_flat = x_slice.reshape(B * chunk_len, d_slice)
 
-                # 1. Project to cell space
-                z = x_flat @ self.W_in[i]  # (B*chunk_len, d_cell)
+                # 1. Project to cell space (cast fp32 master weight to input dtype)
+                z = x_flat @ self.W_in[i].to(dtype=dt)  # (B*chunk_len, d_cell)
 
-                # 2. Memory prediction with current M
-                M, T_mask = self._M[i], self._T[i]
+                # 2. Memory prediction with current M (M kept in input dtype)
+                M, T_mask = self._M[i].to(dtype=dt), self._T[i].to(dtype=dt)
                 z_pred = ((M * T_mask) @ z.T).T  # (B*chunk_len, d_cell)
 
                 # 3. Error and novelty
@@ -158,13 +161,13 @@ class CellMem(nn.Module):
 
                 # 4. Astrocyte modulation (on chunk stats)
                 z_norms = z.norm(dim=-1)
-                mu = self._astro_mu[i]
-                sigma = self._astro_sigma[i]
+                mu = self._astro_mu[i].to(dtype=dt)
+                sigma = self._astro_sigma[i].to(dtype=dt)
                 mu = 0.99 * mu + 0.01 * z_norms.mean().detach()
                 sigma = 0.99 * sigma + 0.01 * ((z_norms.detach() - mu) ** 2).mean()
                 self._astro_mu[i] = mu
                 self._astro_sigma[i] = sigma
-                alpha_eff = self.alpha_base[i] * (sigma / (mu + 1e-8))
+                alpha_eff = self.alpha_base[i].to(dtype=dt) * (sigma / (mu + 1e-8))
 
                 # 5. Anti-Hebbian update: ONE update using chunk mean
                 delta_M = alpha_eff * (error.unsqueeze(-1) * z.unsqueeze(-2)).mean(dim=0)
@@ -173,20 +176,20 @@ class CellMem(nn.Module):
                 # 6. Topology update (detached)
                 error_d = error.detach()
                 z_d = z.detach()
-                gamma_val = self.gamma[i].detach()
-                tau_val = self.tau[i].detach()
+                gamma_val = self.gamma[i].detach().to(dtype=dt)
+                tau_val = self.tau[i].detach().to(dtype=dt)
                 delta_T = gamma_val * (
                     (error_d.abs().unsqueeze(-1) * z_d.abs().unsqueeze(-2)).mean(dim=0)
                     - tau_val * T_mask
                 )
                 self._T[i] = (T_mask + delta_T).clamp(0, 1)
 
-                # 7. MSB fan-out
+                # 7. MSB fan-out (cast fp32 master weights to input dtype)
                 mem_out = ((self._M[i] * self._T[i]) @ z.T).T  # (B*chunk_len, d_cell)
-                chunk_attn.append((mem_out @ self.W_msb[i][0]).reshape(B, chunk_len, d_slice))
-                chunk_mlp.append((mem_out @ self.W_msb[i][1]).reshape(B, chunk_len, d_slice))
-                chunk_add.append((mem_out @ self.W_msb[i][2]).reshape(B, chunk_len, d_slice))
-                chunk_x0.append((mem_out @ self.W_msb[i][3]).reshape(B, chunk_len, d_slice))
+                chunk_attn.append((mem_out @ self.W_msb[i][0].to(dtype=dt)).reshape(B, chunk_len, d_slice))
+                chunk_mlp.append((mem_out @ self.W_msb[i][1].to(dtype=dt)).reshape(B, chunk_len, d_slice))
+                chunk_add.append((mem_out @ self.W_msb[i][2].to(dtype=dt)).reshape(B, chunk_len, d_slice))
+                chunk_x0.append((mem_out @ self.W_msb[i][3].to(dtype=dt)).reshape(B, chunk_len, d_slice))
 
             all_attn.append(torch.cat(chunk_attn, dim=-1))
             all_mlp.append(torch.cat(chunk_mlp, dim=-1))

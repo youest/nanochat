@@ -37,6 +37,20 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # CellMem: biologically-inspired memory module (disabled by default = no regression)
+    cellmem_enabled: bool = False
+    cellmem_d_cell: int = 32
+    cellmem_n_cells: int = 2
+    cellmem_chunk_size: int = 32
+    cellmem_layers: tuple = ()  # which layers get CellMem; empty = auto-select
+
+
+def has_cellmem(layer_idx, config):
+    """Returns True if GPT layer should have a CellMem module."""
+    if not config.cellmem_enabled:
+        return False
+    layers = config.cellmem_layers or (config.n_layer // 6, 3 * config.n_layer // 4)
+    return layer_idx in layers
 
 
 def norm(x):
@@ -145,9 +159,18 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, kv_cache,
+                g_attn=None, g_mlp=None, r_add=None):
+        attn_out = self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        if g_attn is not None:
+            attn_out = attn_out * torch.sigmoid(g_attn)
+        x = x + attn_out
+        if r_add is not None:
+            x = x + r_add
+        mlp_out = self.mlp(norm(x))
+        if g_mlp is not None:
+            mlp_out = mlp_out * torch.sigmoid(g_mlp)
+        x = x + mlp_out
         return x
 
 
@@ -188,6 +211,13 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # CellMem modules (only on selected layers, same pattern as value_embeds)
+        if config.cellmem_enabled:
+            from nanochat.cellmem import CellMem, CellMemConfig
+            cm_cfg = CellMemConfig(d_model=config.n_embd, d_cell=config.cellmem_d_cell, n_cells=config.cellmem_n_cells)
+            self.cellmems = nn.ModuleDict({str(i): CellMem(cm_cfg) for i in range(config.n_layer) if has_cellmem(i, config)})
+        else:
+            self.cellmems = nn.ModuleDict()
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -246,6 +276,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # CellMem: zero-init r_add and x0_mod projections so model starts unperturbed
+        for cm in self.cellmems.values():
+            for i in range(cm.config.n_cells):
+                torch.nn.init.zeros_(cm.W_msb[i][2])  # r_add
+                torch.nn.init.zeros_(cm.W_msb[i][3])  # x0_mod
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -378,7 +414,17 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # CellMem parameters: W_in/W_msb -> Muon (matrices), alpha/gamma/tau -> AdamW (scalars)
+        cellmem_matrix_params = []
+        cellmem_scalar_params = []
+        for cm in self.cellmems.values():
+            for name, p in cm.named_parameters():
+                if 'W_in' in name or 'W_msb' in name:
+                    cellmem_matrix_params.append(p)
+                else:
+                    cellmem_scalar_params.append(p)
+        all_param_count = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(cellmem_matrix_params) + len(cellmem_scalar_params)
+        assert len(list(self.parameters())) == all_param_count
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -394,9 +440,12 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if cellmem_scalar_params:
+            param_groups.append(dict(kind='adamw', params=cellmem_scalar_params, lr=scalar_lr * 0.1, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        all_matrix_params = matrix_params + cellmem_matrix_params
+        for shape in sorted({p.shape for p in all_matrix_params}):
+            group_params = [p for p in all_matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
@@ -443,15 +492,45 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
+        # CellMem: pre-compute chunked outputs for training (all CellMem layers at once)
+        cellmem_outputs = {}
+        if self.cellmems:
+            if kv_cache is None:
+                # Training: reset state per sequence, use chunked forward
+                for cm in self.cellmems.values():
+                    cm.reset_state(B)
+                for layer_str, cm in self.cellmems.items():
+                    cellmem_outputs[layer_str] = cm.forward_chunked(x, chunk_size=self.config.cellmem_chunk_size)
+            # Inference: CellMem state persists across calls (managed externally)
+
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
         for i, block in enumerate(self.transformer.h):
+            # CellMem gates for this layer (if applicable)
+            g_attn, g_mlp, r_add = None, None, None
+            if str(i) in self.cellmems:
+                if kv_cache is None:
+                    # Training: use pre-computed chunked outputs
+                    g_attn, g_mlp, r_add, x0_mod = cellmem_outputs[str(i)]
+                else:
+                    # Inference: per-token or prefill
+                    cm = self.cellmems[str(i)]
+                    if T > 1:
+                        g_attn, g_mlp, r_add, x0_mod = cm.forward_chunked(x, chunk_size=self.config.cellmem_chunk_size)
+                    else:
+                        g_attn_t, g_mlp_t, r_add_t, x0_mod_t = cm(x.squeeze(1))
+                        g_attn = g_attn_t.unsqueeze(1)
+                        g_mlp = g_mlp_t.unsqueeze(1)
+                        r_add = r_add_t.unsqueeze(1)
+                        x0_mod = x0_mod_t.unsqueeze(1)
+
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache,
+                      g_attn=g_attn, g_mlp=g_mlp, r_add=r_add)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -490,6 +569,9 @@ class GPT(nn.Module):
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+        # Reset CellMem state for new generation
+        for cm in self.cellmems.values():
+            cm.reset_state(1)
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
