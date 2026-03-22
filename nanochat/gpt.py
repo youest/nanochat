@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -578,18 +579,50 @@ class GPT(nn.Module):
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
-        for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
-            logits = logits[:, -1, :] # (B, vocab_size)
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            if temperature > 0:
-                logits = logits / temperature
-                probs = F.softmax(logits, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
-            else:
-                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_ids), dim=1)
-            token = next_ids.item()
-            yield token
+
+        # CellMem v2: load memory from disk if available
+        surprise_calc = None
+        if self.config.cellmem.enabled:
+            from nanochat.cellmem_v2 import MemoryStore, SurpriseCalculator
+            mem_dir = Path(self.config.cellmem.memory_dir).expanduser()
+            mem_path = mem_dir / "memory.pt"
+            self.memory_store = MemoryStore(self.config.cellmem, d_model=self.config.n_embd)
+            if mem_path.exists():
+                self.memory_store.load(mem_path)
+            surprise_calc = SurpriseCalculator(self.config.cellmem)
+
+        try:
+            for _ in range(max_tokens):
+                logits = self.forward(ids) # (B, T, vocab_size)
+                logits = logits[:, -1, :] # (B, vocab_size)
+
+                # CellMem v2: compute surprise and write memories
+                if self.config.cellmem.enabled and self.memory_store is not None and surprise_calc is not None:
+                    if ids.size(1) > 1:
+                        target = ids[:, -1:]  # the token we just appended
+                        surprise = surprise_calc.compute_surprise(
+                            logits.unsqueeze(1), target
+                        )
+                        if surprise[0, 0] > self.config.cellmem.surprise_threshold:
+                            hidden = self.transformer.wte(target).squeeze(0).squeeze(0).detach().float()
+                            self.memory_store.write(hidden, surprise=surprise[0, 0].item())
+
+                if top_k is not None and top_k > 0:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                if temperature > 0:
+                    logits = logits / temperature
+                    probs = F.softmax(logits, dim=-1)
+                    next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+                else:
+                    next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+                ids = torch.cat((ids, next_ids), dim=1)
+                token = next_ids.item()
+                yield token
+        finally:
+            # CellMem v2: save memory to disk (runs even if generator is closed early)
+            if self.config.cellmem.enabled and self.memory_store is not None:
+                mem_dir = Path(self.config.cellmem.memory_dir).expanduser()
+                mem_dir.mkdir(parents=True, exist_ok=True)
+                self.memory_store.save(mem_dir / "memory.pt")
+                self.memory_store.snapshot()
