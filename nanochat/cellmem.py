@@ -16,6 +16,7 @@ class CellMemConfig:
     alpha_init: float = 0.1
     gamma_init: float = 0.01
     tau_init: float = 0.01
+    max_M_norm: float = 10.0  # clamp M spectral norm to prevent explosion
 
 
 class CellMem(nn.Module):
@@ -99,7 +100,12 @@ class CellMem(nn.Module):
 
             # 5. Anti-Hebbian memory update (differentiable — gradients flow through M chain)
             delta_M = alpha_eff * (error.unsqueeze(-1) * z.unsqueeze(-2)).mean(dim=0)
-            self._M[i] = M + delta_M
+            M_new = M + delta_M
+            # Clamp M norm to prevent explosion during training
+            M_norm = M_new.norm()
+            if M_norm > self.config.max_M_norm:
+                M_new = M_new * (self.config.max_M_norm / M_norm)
+            self._M[i] = M_new
 
             # 6. Topology update (detached — T is a structural mask, not a smooth function)
             error_d = error.detach()
@@ -173,7 +179,11 @@ class CellMem(nn.Module):
 
                 # 5. Anti-Hebbian update: ONE update using chunk mean
                 delta_M = alpha_eff * (error.unsqueeze(-1) * z.unsqueeze(-2)).mean(dim=0)
-                self._M[i] = M + delta_M
+                M_new = M + delta_M
+                M_norm = M_new.norm()
+                if M_norm > self.config.max_M_norm:
+                    M_new = M_new * (self.config.max_M_norm / M_norm)
+                self._M[i] = M_new
 
                 # 6. Topology update (detached)
                 error_d = error.detach()
