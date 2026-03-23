@@ -1,0 +1,173 @@
+# SkyPilot managed spot job for nanochat training.
+# Handles preemption recovery and multi-region failover automatically.
+# Checkpoints persist on S3; dataset downloads to local NVMe.
+#
+# Usage:
+#   sky jobs launch runs/spot_train.yaml                           # full pipeline
+#   sky jobs launch runs/spot_train.yaml --env SKIP_TOKENIZER=1    # skip tokenizer
+#   sky jobs launch runs/spot_train.yaml --env DEPTH=12            # smaller model
+#   sky jobs queue                                                 # check status
+#   sky jobs logs                                                  # view logs
+#
+# Spec: docs/superpowers/specs/2026-03-23-spot-training-design.md
+
+resources:
+  accelerators: H100:8
+  use_spot: true
+  any_of:
+    - region: eu-west-2    # London — cheapest (~$9-12/h)
+    - region: us-west-2    # Oregon — high availability (~$18/h)
+    - region: us-east-1    # Virginia — high availability (~$18/h)
+
+file_mounts:
+  /checkpoints:
+    name: nanochat-checkpoints
+    store: s3
+
+envs:
+  DEPTH: 24
+  SKIP_TOKENIZER: "0"
+  SKIP_SFT: "0"
+  SAVE_EVERY: 500
+  TARGET_RATIO: 8
+
+setup: |
+  # Clone repo and install dependencies
+  git clone https://github.com/youest/nanochat.git ~/nanochat 2>/dev/null || \
+    (cd ~/nanochat && git fetch && git checkout cellmem/v2 && git pull)
+  cd ~/nanochat && git checkout cellmem/v2
+
+  # Install uv and project dependencies
+  command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  cd ~/nanochat
+  [ -d ".venv" ] || uv venv
+  uv sync --extra gpu
+
+run: |
+  set -e
+  cd ~/nanochat
+  source .venv/bin/activate
+  export OMP_NUM_THREADS=1
+
+  # --- Storage layout ---
+  # Local NVMe: dataset + training artifacts (fast, lost on preemption)
+  # S3 mount:   checkpoints + tokenizer (persistent across preemptions)
+  LOCAL_DIR=/local/nanochat
+  S3_DIR=/checkpoints/nanochat
+  CKPT_SUBDIR=base_checkpoints/d${DEPTH}
+  mkdir -p $LOCAL_DIR $LOCAL_DIR/$CKPT_SUBDIR
+
+  # --- Sync checkpoints from S3 to local ---
+  if [ -d "$S3_DIR/$CKPT_SUBDIR" ]; then
+    echo "Syncing checkpoints from S3 to local NVMe..."
+    rsync -av $S3_DIR/$CKPT_SUBDIR/ $LOCAL_DIR/$CKPT_SUBDIR/ 2>/dev/null || \
+      cp -r $S3_DIR/$CKPT_SUBDIR/* $LOCAL_DIR/$CKPT_SUBDIR/ 2>/dev/null || true
+  fi
+
+  # --- Sync tokenizer from S3 if exists ---
+  if [ -d "$S3_DIR/tokenizer" ]; then
+    mkdir -p $LOCAL_DIR/tokenizer
+    cp -r $S3_DIR/tokenizer/* $LOCAL_DIR/tokenizer/ 2>/dev/null || true
+  fi
+
+  export NANOCHAT_BASE_DIR=$LOCAL_DIR
+
+  # --- Background checkpoint sync to S3 ---
+  sync_to_s3() {
+    while true; do
+      sleep 120
+      if [ -d "$LOCAL_DIR/$CKPT_SUBDIR" ]; then
+        rsync -av $LOCAL_DIR/$CKPT_SUBDIR/ $S3_DIR/$CKPT_SUBDIR/ 2>/dev/null || \
+          cp -r $LOCAL_DIR/$CKPT_SUBDIR/* $S3_DIR/$CKPT_SUBDIR/ 2>/dev/null || true
+      fi
+    done
+  }
+  sync_to_s3 &
+  SYNC_PID=$!
+  trap "kill $SYNC_PID 2>/dev/null; rsync -av $LOCAL_DIR/$CKPT_SUBDIR/ $S3_DIR/$CKPT_SUBDIR/ 2>/dev/null || true" EXIT
+
+  # =========================================================================
+  # Stage 1: Tokenizer
+  # =========================================================================
+  TOKENIZER_EXISTS=$(ls $LOCAL_DIR/tokenizer/*.bin 2>/dev/null | head -1)
+  if [ "$SKIP_TOKENIZER" = "0" ] && [ -z "$TOKENIZER_EXISTS" ]; then
+    echo "=== Stage 1: Tokenizer ==="
+    python -m nanochat.dataset -n 8
+    python -m nanochat.dataset -n 170 &
+    DATASET_PID=$!
+    python -m scripts.tok_train
+    python -m scripts.tok_eval
+    # Persist tokenizer to S3
+    mkdir -p $S3_DIR/tokenizer
+    cp -r $LOCAL_DIR/tokenizer/* $S3_DIR/tokenizer/ 2>/dev/null || true
+    echo "Waiting for dataset download..."
+    wait $DATASET_PID
+  else
+    echo "=== Stage 1: Tokenizer (skipped) ==="
+    # Still need dataset for training
+    python -m nanochat.dataset -n 170 &
+    DATASET_PID=$!
+  fi
+
+  # =========================================================================
+  # Stage 2: Base Training (with resume)
+  # =========================================================================
+  echo "=== Stage 2: Base Training ==="
+
+  # Detect last checkpoint for resume
+  LAST_STEP=$(ls $LOCAL_DIR/$CKPT_SUBDIR/meta_*.json 2>/dev/null \
+    | sed 's/.*meta_0*\([0-9]*\)\.json/\1/' | sort -n | tail -1)
+
+  RESUME_FLAG=""
+  if [ -n "$LAST_STEP" ] && [ "$LAST_STEP" -gt 0 ] 2>/dev/null; then
+    echo "Resuming from step $LAST_STEP"
+    RESUME_FLAG="--resume-from-step=$LAST_STEP"
+  else
+    echo "Starting fresh training"
+  fi
+
+  # Wait for dataset if still downloading
+  [ -n "$DATASET_PID" ] && wait $DATASET_PID 2>/dev/null || true
+
+  torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=$DEPTH \
+    --target-param-data-ratio=$TARGET_RATIO \
+    --device-batch-size=16 \
+    --save-every=$SAVE_EVERY \
+    --fp8 \
+    --run=dummy \
+    $RESUME_FLAG
+
+  # Final sync to S3
+  echo "Syncing final checkpoint to S3..."
+  rsync -av $LOCAL_DIR/$CKPT_SUBDIR/ $S3_DIR/$CKPT_SUBDIR/ 2>/dev/null || \
+    cp -r $LOCAL_DIR/$CKPT_SUBDIR/* $S3_DIR/$CKPT_SUBDIR/ 2>/dev/null || true
+
+  # =========================================================================
+  # Stage 3: Base Eval
+  # =========================================================================
+  echo "=== Stage 3: Base Eval ==="
+  torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+
+  # =========================================================================
+  # Stage 4: SFT (optional)
+  # =========================================================================
+  if [ "$SKIP_SFT" = "0" ]; then
+    echo "=== Stage 4: SFT ==="
+    curl -L -o $LOCAL_DIR/identity_conversations.jsonl \
+      https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+    torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- \
+      --device-batch-size=16 --run=dummy
+    torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+    # Persist SFT checkpoints to S3
+    rsync -av $LOCAL_DIR/ $S3_DIR/ --include="*sft*" --exclude="base_data_*" 2>/dev/null || true
+  else
+    echo "=== Stage 4: SFT (skipped) ==="
+  fi
+
+  echo "========================================="
+  echo "TRAINING COMPLETE"
+  echo "Download results:"
+  echo "  aws s3 sync s3://nanochat-checkpoints/nanochat/base_checkpoints/ ~/.cache/nanochat/base_checkpoints/"
+  echo "========================================="

@@ -175,8 +175,8 @@ def compute_recall_score(model, store, tokenizer, device, learn_hiddens):
         # Compare to the learn-phase hidden for the corresponding fact
         if i < len(learn_hiddens):
             sim = F.cosine_similarity(
-                recall_hidden.unsqueeze(0).float(),
-                learn_hiddens[i].unsqueeze(0).float()
+                recall_hidden.unsqueeze(0).cpu().float(),
+                learn_hiddens[i].unsqueeze(0).cpu().float()
             ).item()
             similarities.append(sim)
     return sum(similarities) / len(similarities) if similarities else 0.0
@@ -268,6 +268,8 @@ def main():
                         help="Model tag within checkpoint dir (default: auto-detect largest)")
     parser.add_argument("--device", type=str, default=None,
                         help="Device to use (default: auto-detect)")
+    parser.add_argument("--force-gate", type=float, default=None,
+                        help="Force mem_gates to this value (bypasses sigmoid(-10) init)")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -289,6 +291,13 @@ def main():
     )
     model.eval()
     print(f"Model loaded: n_layer={model.config.n_layer}, n_embd={model.config.n_embd}")
+
+    # Force gate values if requested
+    if args.force_gate is not None and model.mem_gates is not None:
+        print(f"Forcing mem_gates to {args.force_gate}")
+        with torch.no_grad():
+            for gate in model.mem_gates:
+                gate.fill_(args.force_gate)
 
     # Run each configuration
     results = []
