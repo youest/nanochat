@@ -151,8 +151,8 @@ class CausalSelfAttention(nn.Module):
             K_mem, V_mem = mem_kv
             # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
             q_sdpa = q.transpose(1, 2)
-            k_mem_sdpa = K_mem.transpose(1, 2)
-            v_mem_sdpa = V_mem.transpose(1, 2)
+            k_mem_sdpa = K_mem.transpose(1, 2).to(q_sdpa.dtype)
+            v_mem_sdpa = V_mem.transpose(1, 2).to(q_sdpa.dtype)
             enable_gqa = q_sdpa.size(1) != k_mem_sdpa.size(1)
             y_mem = F.scaled_dot_product_attention(q_sdpa, k_mem_sdpa, v_mem_sdpa,
                                                     is_causal=False, enable_gqa=enable_gqa)
