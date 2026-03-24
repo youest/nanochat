@@ -137,7 +137,7 @@ class WorkerPool:
                 import torch.nn as nn
                 from nanochat.gpt import _cellmem_layer_indices
                 from nanochat.cellmem_v2 import CellMemConfig
-                cellmem_cfg = CellMemConfig(enabled=True, layers="mid", surprise_threshold=2.0)
+                cellmem_cfg = CellMemConfig(enabled=True, layers="mid", surprise_threshold=6.0)
                 model.config.cellmem = cellmem_cfg
                 model._cellmem_layers = _cellmem_layer_indices(model.config)
                 if model._cellmem_layers:
@@ -450,6 +450,27 @@ async def memory_status():
         "write_mode": store.config.write_mode,
         "slots": slots,
     }
+
+@app.post("/memory/reset")
+async def memory_reset():
+    """Reset CellMem memory."""
+    if not args.cellmem:
+        return {"status": "cellmem disabled"}
+    worker_pool = app.state.worker_pool
+    for w in worker_pool.workers:
+        store = getattr(w.engine.model, 'memory_store', None)
+        if store is not None:
+            from nanochat.cellmem_v2 import MemoryStore
+            w.engine.model.memory_store = MemoryStore(
+                w.engine.model.config.cellmem, d_model=w.engine.model.config.n_embd
+            )
+    # Delete persisted memory file
+    import shutil
+    from pathlib import Path
+    mem_dir = Path(worker_pool.workers[0].engine.model.config.cellmem.memory_dir).expanduser()
+    if (mem_dir / "memory.pt").exists():
+        (mem_dir / "memory.pt").unlink()
+    return {"status": "memory reset", "slots": 0}
 
 @app.get("/health")
 async def health():

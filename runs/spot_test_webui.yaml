@@ -52,4 +52,4 @@ run: |
   cd ~/nanochat
   source .venv/bin/activate
   echo "Starting CellMem web UI..."
-  python -m scripts.chat_web --base --cellmem --port 8001 --host 0.0.0.0
+  python -m scripts.chat_web --base --cellmem --port 8001 --host 0.0.0.0 --max-tokens 128

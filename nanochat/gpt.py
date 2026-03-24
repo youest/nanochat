@@ -600,12 +600,15 @@ class GPT(nn.Module):
                 if self.config.cellmem.enabled and self.memory_store is not None and surprise_calc is not None:
                     if ids.size(1) > 1:
                         target = ids[:, -1:]  # the token we just appended
-                        surprise = surprise_calc.compute_surprise(
-                            logits.unsqueeze(1), target
-                        )
-                        if surprise[0, 0] > self.config.cellmem.surprise_threshold:
-                            hidden = self.transformer.wte(target).squeeze(0).squeeze(0).detach().float()
-                            self.memory_store.write(hidden, surprise=surprise[0, 0].item())
+                        target_id = target.item()
+                        # Skip special tokens (BOS, chat markers) — they carry no semantic info
+                        if target_id < self.config.vocab_size - 16:  # special tokens are at end of vocab
+                            surprise = surprise_calc.compute_surprise(
+                                logits.unsqueeze(1), target
+                            )
+                            if surprise[0, 0] > self.config.cellmem.surprise_threshold:
+                                hidden = self.transformer.wte(target).squeeze(0).squeeze(0).detach().float()
+                                self.memory_store.write(hidden, surprise=surprise[0, 0].item())
 
                 if top_k is not None and top_k > 0:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

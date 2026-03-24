@@ -356,7 +356,10 @@
     </div>
 
     <div class="memory-panel" id="memoryPanel">
-        <h3>CellMem v2</h3>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.25rem">
+            <h3 style="margin:0">CellMem v2</h3>
+            <button onclick="resetMemory()" style="font-size:0.7rem;padding:2px 8px;border:1px solid #d1d5db;border-radius:4px;background:#fff;cursor:pointer" title="Clear all memories">Reset</button>
+        </div>
         <div class="memory-stats" id="memoryStats">Loading...</div>
         <div class="memory-grid" id="memoryGrid"></div>
     </div>
@@ -714,6 +717,13 @@
             } catch (e) {
                 // silently ignore
             }
+        }
+
+        async function resetMemory() {
+            try {
+                await fetch(`${API_URL}/memory/reset`, { method: 'POST' });
+                refreshMemory();
+            } catch (e) { /* ignore */ }
         }
 
         // Initial check + poll after each message
