@@ -106,6 +106,8 @@ def build_model(checkpoint_dir, step, device, phase):
     model.to_empty(device=device)
     model.to(dtype=ckpt_dtype)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    # Move checkpoint data to device before loading (assign=True replaces tensors in-place)
+    model_data = {k: v.to(device=device, dtype=ckpt_dtype) for k, v in model_data.items()}
     missing, unexpected = model.load_state_dict(model_data, strict=False, assign=True)
     if missing:
         log0(f"Missing keys in checkpoint (using init defaults): {missing}")
