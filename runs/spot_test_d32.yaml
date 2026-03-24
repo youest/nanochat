@@ -1,0 +1,56 @@
+# SkyPilot cluster for testing CellMem with Karpathy's pre-trained d32 model.
+# Downloads weights from HuggingFace, serves web UI with CellMem enabled.
+#
+# Usage:
+#   sky launch runs/spot_test_d32.yaml -c cellmem-d32    # launch
+#   ssh -L 8001:localhost:8001 cellmem-d32                # tunnel
+#   open http://localhost:8001                             # browser
+#   sky down cellmem-d32                                   # cleanup
+
+resources:
+  accelerators: T4:1
+  use_spot: true
+  any_of:
+    - region: eu-west-2    # London
+    - region: us-east-1    # Virginia
+
+setup: |
+  git clone https://github.com/youest/nanochat.git ~/nanochat 2>/dev/null || \
+    (cd ~/nanochat && git fetch && git checkout cellmem/v2 && git pull)
+  cd ~/nanochat && git checkout cellmem/v2
+
+  command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  cd ~/nanochat
+  [ -d ".venv" ] || uv venv
+  uv sync --extra gpu
+
+  # Fix torch CUDA if needed
+  source .venv/bin/activate
+  python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
+    echo "CUDA not available, reinstalling torch for cu126..."
+    uv pip install --reinstall torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
+  }
+
+  # Download Karpathy's d32 checkpoint from HuggingFace
+  pip install huggingface_hub 2>/dev/null
+  mkdir -p ~/.cache/nanochat/base_checkpoints/d32
+  mkdir -p ~/.cache/nanochat/tokenizer
+  python -c "
+from huggingface_hub import hf_hub_download
+import shutil
+repo = 'karpathy/nanochat-d32'
+for f in ['model_000650.pt', 'meta_000650.json']:
+    path = hf_hub_download(repo, f)
+    shutil.copy(path, '$HOME/.cache/nanochat/base_checkpoints/d32/')
+for f in ['token_bytes.pt', 'tokenizer.pkl']:
+    path = hf_hub_download(repo, f)
+    shutil.copy(path, '$HOME/.cache/nanochat/tokenizer/')
+print('d32 checkpoint downloaded')
+"
+
+run: |
+  cd ~/nanochat
+  source .venv/bin/activate
+  echo "Starting CellMem web UI with d32..."
+  python -m scripts.chat_web --base --cellmem --port 8001 --host 0.0.0.0 --max-tokens 128
