@@ -103,7 +103,8 @@ def build_model(checkpoint_dir, step, device, phase):
     # Detect checkpoint dtype and load in that precision to save GPU memory
     ckpt_dtype = next(iter(model_data.values())).dtype
     log0(f"Checkpoint dtype: {ckpt_dtype}")
-    model.to_empty(device=device, dtype=ckpt_dtype)
+    model.to_empty(device=device)
+    model.to(dtype=ckpt_dtype)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
