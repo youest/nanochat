@@ -37,74 +37,88 @@
         }
 
         .memory-panel {
-            width: 280px;
-            background: #f9fafb;
-            border-left: 1px solid #e5e7eb;
+            width: 340px;
+            background: #0f1117;
+            border-left: 1px solid #1e2130;
             display: none;
             flex-direction: column;
-            overflow-y: auto;
-            padding: 1rem;
+            overflow: hidden;
         }
 
         .memory-panel.active {
             display: flex;
         }
 
-        .memory-panel h3 {
-            font-size: 0.85rem;
+        .memory-header {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid #1e2130;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .memory-header h3 {
+            font-size: 0.8rem;
             font-weight: 600;
-            margin: 0 0 0.25rem 0;
-            color: #374151;
+            margin: 0;
+            color: #e0e0e0;
+            letter-spacing: 0.05em;
+        }
+
+        .memory-header .reset-btn {
+            font-size: 0.65rem;
+            padding: 2px 8px;
+            border: 1px solid #2a2d3a;
+            border-radius: 4px;
+            background: #1a1d2e;
+            color: #9ca3af;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .memory-header .reset-btn:hover {
+            background: #2a2d3a;
+            color: #e0e0e0;
         }
 
         .memory-stats {
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             color: #6b7280;
-            margin-bottom: 0.75rem;
+            padding: 0.4rem 1rem;
+            border-bottom: 1px solid #1e2130;
         }
 
-        .memory-grid {
-            display: grid;
-            grid-template-columns: repeat(8, 1fr);
-            gap: 3px;
-        }
-
-        .memory-slot {
-            width: 100%;
-            aspect-ratio: 1;
-            border-radius: 3px;
-            background: #e5e7eb;
+        .memory-graph-container {
+            flex: 1;
             position: relative;
-            cursor: pointer;
-            transition: transform 0.15s;
+            overflow: hidden;
         }
 
-        .memory-slot:hover {
-            transform: scale(1.3);
-            z-index: 1;
+        .memory-graph-container svg {
+            width: 100%;
+            height: 100%;
         }
 
-        .memory-slot.active {
-            box-shadow: 0 0 0 1px rgba(0,0,0,0.1);
+        .memory-detail {
+            padding: 0.6rem 1rem;
+            border-top: 1px solid #1e2130;
+            background: #13151f;
+            font-size: 0.7rem;
+            color: #9ca3af;
+            min-height: 60px;
+            max-height: 100px;
+            overflow-y: auto;
         }
 
-        .memory-tooltip {
-            display: none;
-            position: absolute;
-            bottom: calc(100% + 4px);
-            left: 50%;
-            transform: translateX(-50%);
-            background: #1f2937;
-            color: white;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 0.65rem;
-            white-space: nowrap;
-            z-index: 10;
+        .memory-detail .detail-title {
+            color: #e0e0e0;
+            font-weight: 600;
+            margin-bottom: 4px;
         }
 
-        .memory-slot:hover .memory-tooltip {
-            display: block;
+        .memory-detail .detail-tokens {
+            color: #60a5fa;
+            word-break: break-all;
         }
 
         .header {
@@ -356,12 +370,15 @@
     </div>
 
     <div class="memory-panel" id="memoryPanel">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.25rem">
-            <h3 style="margin:0">CellMem v2</h3>
-            <button onclick="resetMemory()" style="font-size:0.7rem;padding:2px 8px;border:1px solid #d1d5db;border-radius:4px;background:#fff;cursor:pointer" title="Clear all memories">Reset</button>
+        <div class="memory-header">
+            <h3>CELLMEM v2</h3>
+            <button class="reset-btn" onclick="resetMemory()" title="Clear all memories">Reset</button>
         </div>
         <div class="memory-stats" id="memoryStats">Loading...</div>
-        <div class="memory-grid" id="memoryGrid"></div>
+        <div class="memory-graph-container" id="memoryGraphContainer"></div>
+        <div class="memory-detail" id="memoryDetail">
+            <div class="detail-title">Hover a node to inspect</div>
+        </div>
     </div>
 
     <script>
@@ -651,27 +668,267 @@
                 chatWrapper.textContent = 'Engine not running. Please start engine.py first.';
             });
 
-        // CellMem memory panel
+        // CellMem memory graph (D3 force-directed)
+        // Inline tiny D3 force simulation (no external deps)
+        const memGraph = {
+            nodes: [],
+            edges: [],
+            sim: null,
+            svg: null,
+            g: null,
+            width: 0,
+            height: 0,
+            selectedNode: null,
+        };
+
         function surpriseToColor(surprise) {
-            const t = Math.min(surprise / 10, 1);
+            const t = Math.min(surprise / 12, 1);
+            // dark-themed palette: deep blue -> cyan -> amber -> red
             if (t < 0.33) {
-                const r = Math.round(59 + t * 3 * (34 - 59));
-                const g = Math.round(130 + t * 3 * (197 - 130));
-                const b = Math.round(246 + t * 3 * (94 - 246));
-                return `rgb(${r},${g},${b})`;
+                const s = t * 3;
+                return `rgb(${Math.round(40 + s * 20)}, ${Math.round(80 + s * 140)}, ${Math.round(200 + s * 55)})`;
             } else if (t < 0.66) {
                 const s = (t - 0.33) * 3;
-                const r = Math.round(34 + s * (245 - 34));
-                const g = Math.round(197 + s * (158 - 197));
-                const b = Math.round(94 + s * (11 - 94));
-                return `rgb(${r},${g},${b})`;
+                return `rgb(${Math.round(60 + s * 185)}, ${Math.round(220 - s * 60)}, ${Math.round(255 - s * 200)})`;
             } else {
                 const s = (t - 0.66) * 3;
-                const r = Math.round(245 + s * (220 - 245));
-                const g = Math.round(158 + s * (38 - 158));
-                const b = Math.round(11 + s * (38 - 11));
-                return `rgb(${r},${g},${b})`;
+                return `rgb(${Math.round(245 - s * 25)}, ${Math.round(160 - s * 120)}, ${Math.round(55 - s * 15)})`;
             }
+        }
+
+        function surpriseToRadius(surprise) {
+            return 6 + Math.min(surprise / 8, 1) * 12;
+        }
+
+        function initMemoryGraph() {
+            const container = document.getElementById('memoryGraphContainer');
+            if (!container) return;
+            const rect = container.getBoundingClientRect();
+            memGraph.width = rect.width || 340;
+            memGraph.height = rect.height || 400;
+
+            // Create SVG
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            svg.setAttribute('viewBox', `0 0 ${memGraph.width} ${memGraph.height}`);
+            svg.style.width = '100%';
+            svg.style.height = '100%';
+
+            // Defs for glow filter
+            const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+            const filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
+            filter.setAttribute('id', 'glow');
+            const blur = document.createElementNS('http://www.w3.org/2000/svg', 'feGaussianBlur');
+            blur.setAttribute('stdDeviation', '3');
+            blur.setAttribute('result', 'blur');
+            const merge = document.createElementNS('http://www.w3.org/2000/svg', 'feMerge');
+            const mn1 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode');
+            mn1.setAttribute('in', 'blur');
+            const mn2 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode');
+            mn2.setAttribute('in', 'SourceGraphic');
+            merge.appendChild(mn1);
+            merge.appendChild(mn2);
+            filter.appendChild(blur);
+            filter.appendChild(merge);
+            defs.appendChild(filter);
+            svg.appendChild(defs);
+
+            // Groups for edges and nodes (edges behind nodes)
+            const edgeGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            edgeGroup.setAttribute('id', 'memEdges');
+            const nodeGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            nodeGroup.setAttribute('id', 'memNodes');
+            const labelGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+            labelGroup.setAttribute('id', 'memLabels');
+            svg.appendChild(edgeGroup);
+            svg.appendChild(nodeGroup);
+            svg.appendChild(labelGroup);
+
+            container.replaceChildren(svg);
+            memGraph.svg = svg;
+        }
+
+        // Simple force simulation (no D3 dependency)
+        function forceSimulate(nodes, edges, width, height) {
+            const alpha = 0.3;
+            const repulsion = 800;
+            const linkDist = 60;
+            const centerStrength = 0.05;
+            const cx = width / 2, cy = height / 2;
+
+            // Init positions if needed
+            for (const n of nodes) {
+                if (n.x === undefined) {
+                    n.x = cx + (Math.random() - 0.5) * width * 0.6;
+                    n.y = cy + (Math.random() - 0.5) * height * 0.6;
+                }
+                n.vx = 0; n.vy = 0;
+            }
+
+            // Run iterations
+            for (let iter = 0; iter < 80; iter++) {
+                const a = alpha * (1 - iter / 80);
+                // Repulsion (charge)
+                for (let i = 0; i < nodes.length; i++) {
+                    for (let j = i + 1; j < nodes.length; j++) {
+                        let dx = nodes[j].x - nodes[i].x;
+                        let dy = nodes[j].y - nodes[i].y;
+                        let d2 = dx * dx + dy * dy;
+                        if (d2 < 1) d2 = 1;
+                        const f = repulsion / d2;
+                        const fx = dx / Math.sqrt(d2) * f * a;
+                        const fy = dy / Math.sqrt(d2) * f * a;
+                        nodes[i].vx -= fx; nodes[i].vy -= fy;
+                        nodes[j].vx += fx; nodes[j].vy += fy;
+                    }
+                }
+                // Attraction (links)
+                for (const e of edges) {
+                    const s = nodes[e.source];
+                    const t = nodes[e.target];
+                    if (!s || !t) continue;
+                    let dx = t.x - s.x;
+                    let dy = t.y - s.y;
+                    const d = Math.sqrt(dx * dx + dy * dy) || 1;
+                    // Stronger attraction for higher similarity
+                    const strength = 0.3 * e.similarity;
+                    const f = (d - linkDist) * strength * a;
+                    const fx = dx / d * f;
+                    const fy = dy / d * f;
+                    s.vx += fx; s.vy += fy;
+                    t.vx -= fx; t.vy -= fy;
+                }
+                // Center gravity
+                for (const n of nodes) {
+                    n.vx += (cx - n.x) * centerStrength * a;
+                    n.vy += (cy - n.y) * centerStrength * a;
+                }
+                // Apply velocity with damping
+                for (const n of nodes) {
+                    n.x += n.vx * 0.6;
+                    n.y += n.vy * 0.6;
+                    n.vx *= 0.4;
+                    n.vy *= 0.4;
+                    // Clamp to bounds
+                    const pad = 20;
+                    n.x = Math.max(pad, Math.min(width - pad, n.x));
+                    n.y = Math.max(pad, Math.min(height - pad, n.y));
+                }
+            }
+        }
+
+        function renderMemoryGraph(data) {
+            if (!memGraph.svg) initMemoryGraph();
+            if (!memGraph.svg) return;
+
+            const container = document.getElementById('memoryGraphContainer');
+            const rect = container.getBoundingClientRect();
+            memGraph.width = rect.width || 340;
+            memGraph.height = rect.height || 400;
+            memGraph.svg.setAttribute('viewBox', `0 0 ${memGraph.width} ${memGraph.height}`);
+
+            const slots = data.slots || [];
+            const edges = data.edges || [];
+
+            // Build nodes — reuse positions from previous layout
+            const oldPositions = {};
+            for (const n of memGraph.nodes) oldPositions[n.id] = { x: n.x, y: n.y };
+            const nodes = slots.map(s => ({
+                id: s.slot,
+                surprise: s.surprise,
+                tokens: s.tokens || [],
+                age: s.age,
+                norm: s.norm,
+                x: oldPositions[s.slot]?.x,
+                y: oldPositions[s.slot]?.y,
+            }));
+
+            // Run simulation
+            forceSimulate(nodes, edges, memGraph.width, memGraph.height);
+            memGraph.nodes = nodes;
+            memGraph.edges = edges;
+
+            // Render edges
+            const edgeGroup = memGraph.svg.querySelector('#memEdges');
+            edgeGroup.replaceChildren();
+            for (const e of edges) {
+                const s = nodes.find(n => n.id === e.source);
+                const t = nodes.find(n => n.id === e.target);
+                if (!s || !t) continue;
+                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                line.setAttribute('x1', s.x);
+                line.setAttribute('y1', s.y);
+                line.setAttribute('x2', t.x);
+                line.setAttribute('y2', t.y);
+                const opacity = 0.1 + e.similarity * 0.5;
+                line.setAttribute('stroke', `rgba(100, 160, 255, ${opacity})`);
+                line.setAttribute('stroke-width', 0.5 + e.similarity * 2);
+                edgeGroup.appendChild(line);
+            }
+
+            // Render nodes
+            const nodeGroup = memGraph.svg.querySelector('#memNodes');
+            nodeGroup.replaceChildren();
+            const labelGroup = memGraph.svg.querySelector('#memLabels');
+            labelGroup.replaceChildren();
+
+            for (const n of nodes) {
+                const r = surpriseToRadius(n.surprise);
+                const color = surpriseToColor(n.surprise);
+
+                // Outer glow circle
+                const glow = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                glow.setAttribute('cx', n.x);
+                glow.setAttribute('cy', n.y);
+                glow.setAttribute('r', r + 3);
+                glow.setAttribute('fill', color);
+                glow.setAttribute('opacity', '0.2');
+                glow.setAttribute('filter', 'url(#glow)');
+                nodeGroup.appendChild(glow);
+
+                // Main circle
+                const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                circle.setAttribute('cx', n.x);
+                circle.setAttribute('cy', n.y);
+                circle.setAttribute('r', r);
+                circle.setAttribute('fill', color);
+                circle.setAttribute('stroke', n.id === memGraph.selectedNode ? '#ffffff' : 'rgba(255,255,255,0.15)');
+                circle.setAttribute('stroke-width', n.id === memGraph.selectedNode ? '2' : '1');
+                circle.setAttribute('cursor', 'pointer');
+                circle.addEventListener('mouseenter', () => showNodeDetail(n));
+                circle.addEventListener('click', () => {
+                    memGraph.selectedNode = n.id;
+                    showNodeDetail(n);
+                });
+                nodeGroup.appendChild(circle);
+
+                // Label (first token, truncated)
+                if (n.tokens.length > 0 && r > 8) {
+                    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    const txt = n.tokens[0].length > 8 ? n.tokens[0].slice(0, 7) + '…' : n.tokens[0];
+                    label.setAttribute('x', n.x);
+                    label.setAttribute('y', n.y + r + 12);
+                    label.setAttribute('text-anchor', 'middle');
+                    label.setAttribute('fill', '#9ca3af');
+                    label.setAttribute('font-size', '9');
+                    label.setAttribute('font-family', 'system-ui, sans-serif');
+                    label.textContent = txt;
+                    labelGroup.appendChild(label);
+                }
+            }
+        }
+
+        function showNodeDetail(node) {
+            const detail = document.getElementById('memoryDetail');
+            if (!detail) return;
+            detail.replaceChildren();
+            const title = document.createElement('div');
+            title.className = 'detail-title';
+            title.textContent = `Slot #${node.id}  ·  surprise: ${node.surprise}  ·  norm: ${node.norm}`;
+            detail.appendChild(title);
+            const tokens = document.createElement('div');
+            tokens.className = 'detail-tokens';
+            tokens.textContent = node.tokens.join('  ·  ');
+            detail.appendChild(tokens);
         }
 
         async function refreshMemory() {
@@ -680,7 +937,6 @@
                 const data = await res.json();
                 const panel = document.getElementById('memoryPanel');
                 const stats = document.getElementById('memoryStats');
-                const grid = document.getElementById('memoryGrid');
 
                 if (data.cellmem === 'disabled') {
                     panel.classList.remove('active');
@@ -691,29 +947,14 @@
 
                 if (!data.slots) {
                     stats.textContent = data.memory_store || 'No memory yet';
-                    grid.replaceChildren();
                     return;
                 }
 
                 const mode = data.write_mode || 'raw';
-                stats.textContent = `${data.active_slots}/${data.total_slots} slots | mode: ${mode}`;
+                const edgeCount = (data.edges || []).length;
+                stats.textContent = `${data.active_slots}/${data.total_slots} slots · ${edgeCount} edges · ${mode}`;
 
-                // Build grid using safe DOM methods
-                grid.replaceChildren();
-                for (let i = 0; i < data.total_slots; i++) {
-                    const slot = data.slots.find(s => s.slot === i);
-                    const div = document.createElement('div');
-                    div.className = 'memory-slot' + (slot ? ' active' : '');
-                    if (slot) {
-                        div.style.background = surpriseToColor(slot.surprise);
-                        const tip = document.createElement('div');
-                        tip.className = 'memory-tooltip';
-                        const tokens = slot.tokens ? slot.tokens.join(', ') : '';
-                        tip.textContent = `#${i} s:${slot.surprise} | ${tokens}`;
-                        div.appendChild(tip);
-                    }
-                    grid.appendChild(div);
-                }
+                renderMemoryGraph(data);
             } catch (e) {
                 // silently ignore
             }
@@ -722,6 +963,9 @@
         async function resetMemory() {
             try {
                 await fetch(`${API_URL}/memory/reset`, { method: 'POST' });
+                memGraph.nodes = [];
+                memGraph.edges = [];
+                memGraph.selectedNode = null;
                 refreshMemory();
             } catch (e) { /* ignore */ }
         }

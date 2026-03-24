@@ -443,12 +443,26 @@ async def memory_status():
             "norm": round(store.vectors[i].norm().item(), 2),
             "tokens": top_tokens,
         })
+    # Compute pairwise cosine similarity edges (only above threshold)
+    edges = []
+    if store.active_count > 1:
+        import torch.nn.functional as F
+        active_vecs = store.vectors[:store.active_count].float()
+        norms = active_vecs.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        normed = active_vecs / norms
+        sim_matrix = normed @ normed.T
+        for i in range(store.active_count):
+            for j in range(i + 1, store.active_count):
+                sim = sim_matrix[i, j].item()
+                if sim > 0.3:
+                    edges.append({"source": i, "target": j, "similarity": round(sim, 3)})
     return {
         "cellmem": "enabled",
         "active_slots": store.active_count,
         "total_slots": store.config.n_slots,
         "write_mode": store.config.write_mode,
         "slots": slots,
+        "edges": edges,
     }
 
 @app.post("/memory/reset")
