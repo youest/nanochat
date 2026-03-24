@@ -50,7 +50,7 @@ class MemoryStore:
         Returns zero vector if memory is empty."""
         if self.active_count == 0:
             return torch.zeros_like(query)
-        active = self.vectors[:self.active_count]           # [A, d]
+        active = self.vectors[:self.active_count].to(query.device)  # [A, d]
         sim = F.cosine_similarity(query.unsqueeze(0), active, dim=-1)  # [A]
         weights = F.softmax(sim, dim=0)                     # [A]
         return (weights.unsqueeze(-1) * active).sum(0)      # [d]
