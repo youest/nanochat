@@ -113,6 +113,105 @@ def tokenize_texts(texts, tokenizer):
     return [torch.tensor(tokenizer.encode(t), dtype=torch.long) for t in texts]
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic measurements
+# ---------------------------------------------------------------------------
+
+def measure_surprise_distribution(model, tokenizer, device, texts=None):
+    """Measure per-token surprise distribution across a set of texts.
+    Returns all surprise values for histogram analysis."""
+    if texts is None:
+        texts = LEARN_FACTS + INTERFERE_NOISE
+    model.eval()
+    all_surprises = []
+    for text in texts:
+        tokens = torch.tensor(tokenizer.encode(text), dtype=torch.long).unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = model(tokens)
+        if tokens.size(1) > 1:
+            pred_logits = logits[:, :-1, :]
+            targets = tokens[:, 1:]
+            surprises = F.cross_entropy(
+                pred_logits.reshape(-1, pred_logits.size(-1)),
+                targets.reshape(-1),
+                reduction='none'
+            )
+            all_surprises.extend(surprises.cpu().tolist())
+    return all_surprises
+
+
+def measure_memory_quality(store):
+    """Compute memory vector quality metrics.
+    Returns dict with pairwise similarity stats and PCA dimensionality."""
+    if store is None or store.active_count < 2:
+        return {"active": 0, "mean_sim": 0, "min_sim": 0, "max_sim": 0,
+                "pca_dim_80": 0, "pca_dim_95": 0}
+
+    active = store.vectors[:store.active_count].float()
+
+    # Pairwise cosine similarity
+    norms = active.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    normed = active / norms
+    sim_matrix = normed @ normed.T
+    # Extract upper triangle (exclude diagonal)
+    mask = torch.triu(torch.ones_like(sim_matrix, dtype=torch.bool), diagonal=1)
+    pairwise_sims = sim_matrix[mask]
+
+    # PCA: how many components for 80% and 95% variance?
+    centered = active - active.mean(dim=0, keepdim=True)
+    U, S, V = torch.svd(centered)
+    variance_explained = (S ** 2) / (S ** 2).sum()
+    cumvar = variance_explained.cumsum(0)
+    pca_80 = (cumvar < 0.80).sum().item() + 1
+    pca_95 = (cumvar < 0.95).sum().item() + 1
+
+    return {
+        "active": store.active_count,
+        "mean_sim": pairwise_sims.mean().item(),
+        "min_sim": pairwise_sims.min().item(),
+        "max_sim": pairwise_sims.max().item(),
+        "std_sim": pairwise_sims.std().item(),
+        "pca_dim_80": pca_80,
+        "pca_dim_95": pca_95,
+    }
+
+
+def measure_generative_recall(model, tokenizer, device, max_tokens=64):
+    """Generate answers to recall queries and check for expected keywords.
+    Returns per-query results and aggregate score."""
+    model.eval()
+    results = []
+    for i, query in enumerate(RECALL_QUERIES):
+        tokens = torch.tensor(tokenizer.encode(query), dtype=torch.long).unsqueeze(0).to(device)
+        generated_tokens = []
+        with torch.no_grad():
+            for _ in range(max_tokens):
+                logits = model(tokens)
+                next_logit = logits[:, -1, :]
+                next_token = next_logit.argmax(dim=-1, keepdim=True)
+                token_id = next_token.item()
+                # Stop on special tokens
+                decoded = tokenizer.decode([token_id])
+                if '<|' in decoded:
+                    break
+                generated_tokens.append(token_id)
+                tokens = torch.cat([tokens, next_token], dim=1)
+
+        answer = tokenizer.decode(generated_tokens)
+        expected = RECALL_KEYWORDS[i] if i < len(RECALL_KEYWORDS) else []
+        hits = [kw for kw in expected if kw.lower() in answer.lower()]
+        score = len(hits) / len(expected) if expected else 0.0
+        results.append({
+            "query": query,
+            "answer": answer[:120],
+            "hits": hits,
+            "expected": expected,
+            "score": score,
+        })
+    agg = sum(r["score"] for r in results) / len(results) if results else 0.0
+    return results, agg
+
+
 def extract_last_hidden(model, input_ids, device):
     """Run forward pass and extract the last-token hidden state from the final block.
 
@@ -276,35 +375,64 @@ def run_single_config(name, cellmem_cfg, model, tokenizer, device, force_gate=No
         model, store, tokenizer, device, learn_hiddens
     )
 
+    # Memory quality metrics
+    mem_quality = measure_memory_quality(store)
+
+    # Generative recall (does the model actually produce correct answers?)
+    gen_recall_results, gen_recall_score = measure_generative_recall(
+        model, tokenizer, device
+    )
+
     # Cleanup
     model.memory_store = None
 
     return {
         "name": name,
         "recall_score": recall_score,
+        "gen_recall_score": gen_recall_score,
+        "gen_recall_results": gen_recall_results,
         "memories_written": memories_written,
+        "mem_quality": mem_quality,
     }
 
 
 def print_results_table(results):
     """Print a formatted comparison table."""
     baseline_score = None
+    baseline_gen = None
     for r in results:
         if r["name"] == "baseline":
             baseline_score = r["recall_score"]
+            baseline_gen = r["gen_recall_score"]
             break
 
-    header = f"{'Config':<22} {'Recall':>8} {'Delta':>8} {'Mem Slots':>10}"
+    header = f"{'Config':<20} {'HidRecall':>9} {'GenRecall':>9} {'Slots':>6} {'MeanSim':>8} {'PCA80':>6} {'PCA95':>6}"
     print("\n" + "=" * len(header))
     print("CellMem v2 Eval Results")
     print("=" * len(header))
     print(header)
     print("-" * len(header))
     for r in results:
-        delta = r["recall_score"] - baseline_score if baseline_score is not None else 0.0
-        delta_str = f"{delta:+.4f}" if r["name"] != "baseline" else "---"
-        print(f"{r['name']:<22} {r['recall_score']:>8.4f} {delta_str:>8} {r['memories_written']:>10}")
+        mq = r["mem_quality"]
+        mean_sim = f"{mq['mean_sim']:.3f}" if mq['active'] > 1 else "---"
+        pca80 = f"{mq['pca_dim_80']}" if mq['active'] > 1 else "---"
+        pca95 = f"{mq['pca_dim_95']}" if mq['active'] > 1 else "---"
+        print(f"{r['name']:<20} {r['recall_score']:>9.4f} {r['gen_recall_score']:>9.4f} "
+              f"{r['memories_written']:>6} {mean_sim:>8} {pca80:>6} {pca95:>6}")
     print("=" * len(header))
+
+    # Print generative recall details for non-baseline configs
+    for r in results:
+        if r["name"] == "baseline" or not r.get("gen_recall_results"):
+            continue
+        print(f"\n--- Generative Recall: {r['name']} ---")
+        for gr in r["gen_recall_results"]:
+            status = "HIT" if gr["score"] > 0 else "MISS"
+            print(f"  [{status}] Q: {gr['query'][:60]}")
+            print(f"        A: {gr['answer'][:80]}")
+            if gr["hits"]:
+                print(f"        Keywords found: {gr['hits']}")
+        print()
 
 
 def main():
@@ -350,6 +478,20 @@ def main():
         configs = {**CONFIGS_ROUND1, **{k: v for k, v in CONFIGS_ROUND2.items() if k != "baseline"}}
 
     print(f"Round {args.round}: {len(configs)} configurations")
+
+    # Step 0: Measure surprise distribution to calibrate threshold
+    print("\n--- Surprise Distribution Analysis ---")
+    surprises = measure_surprise_distribution(model, tokenizer, device)
+    surprises_sorted = sorted(surprises)
+    n = len(surprises_sorted)
+    print(f"  Total tokens: {n}")
+    print(f"  Min: {surprises_sorted[0]:.2f}, Max: {surprises_sorted[-1]:.2f}")
+    print(f"  Mean: {sum(surprises_sorted)/n:.2f}, Median: {surprises_sorted[n//2]:.2f}")
+    for pct in [50, 75, 90, 95, 99]:
+        idx = min(int(n * pct / 100), n - 1)
+        print(f"  P{pct}: {surprises_sorted[idx]:.2f}")
+    print(f"  Suggested threshold (P90): {surprises_sorted[min(int(n * 0.9), n-1)]:.2f}")
+    print()
 
     # Run each configuration
     results = []
