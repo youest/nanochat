@@ -137,7 +137,7 @@ class WorkerPool:
                 import torch.nn as nn
                 from nanochat.gpt import _cellmem_layer_indices
                 from nanochat.cellmem_v2 import CellMemConfig
-                cellmem_cfg = CellMemConfig(enabled=True, layers="mid", surprise_threshold=6.0)
+                cellmem_cfg = CellMemConfig(enabled=True, layers="mid", surprise_threshold=6.0, write_mode="delta")
                 model.config.cellmem = cellmem_cfg
                 model._cellmem_layers = _cellmem_layer_indices(model.config)
                 if model._cellmem_layers:
