@@ -83,8 +83,7 @@ def build_model(checkpoint_dir, step, device, phase):
     - meta data saved during base model training
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    # Load weights to CPU first to avoid GPU memory spike during model construction
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, torch.device("cpu"), load_optimizer=False)
+    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
     if device.type in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
         model_data = {
@@ -100,14 +99,9 @@ def build_model(checkpoint_dir, step, device, phase):
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
-    # Detect checkpoint dtype and load in that precision to save GPU memory
-    ckpt_dtype = next(iter(model_data.values())).dtype
-    log0(f"Checkpoint dtype: {ckpt_dtype}")
+    # Load the model state
     model.to_empty(device=device)
-    model.to(dtype=ckpt_dtype)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
-    # Move checkpoint data to device before loading (assign=True replaces tensors in-place)
-    model_data = {k: v.to(device=device, dtype=ckpt_dtype) for k, v in model_data.items()}
     missing, unexpected = model.load_state_dict(model_data, strict=False, assign=True)
     if missing:
         log0(f"Missing keys in checkpoint (using init defaults): {missing}")
