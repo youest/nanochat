@@ -107,6 +107,8 @@ def build_model(checkpoint_dir, step, device, phase):
         log0(f"Missing keys in checkpoint (using init defaults): {missing}")
     if unexpected:
         log0(f"Unexpected keys in checkpoint (ignored): {unexpected}")
+    # Ensure consistent dtype across all parameters (assign=True can cause mixed dtypes)
+    model.float()
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
