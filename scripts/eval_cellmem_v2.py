@@ -1,5 +1,8 @@
 """
-CellMem v2 evaluation script: 7-config comparison (baseline + 2 write strategies x 3 layer placements).
+CellMem v2 evaluation script: multi-round A/B comparison.
+
+Round 1 (default): baseline + 2 write strategies x 3 layer placements = 7 configs
+Round 2: raw vs delta write mode for the most promising config = 3 configs
 
 Protocol:
   Phase 1 (LEARN): Feed novel invented facts -> memories accumulate
@@ -7,14 +10,12 @@ Protocol:
   Phase 3 (RECALL): Query facts from Phase 1, measure recall via hidden-state cosine similarity
 
 Usage:
-    python -m scripts.eval_cellmem_v2 --checkpoint path/to/checkpoint_dir
-
-    The checkpoint path should point to a directory containing a nanochat model checkpoint
-    (as produced by base_train.py). The script loads the model, runs each config, and prints
-    a comparison table.
+    python -m scripts.eval_cellmem_v2 --checkpoint path/to/checkpoint_dir              # round 1
+    python -m scripts.eval_cellmem_v2 --checkpoint path/to/checkpoint_dir --round=2    # raw vs delta
+    python -m scripts.eval_cellmem_v2 --checkpoint path/to/checkpoint_dir --round=all  # everything
 
 Importable:
-    from scripts.eval_cellmem_v2 import CONFIGS
+    from scripts.eval_cellmem_v2 import CONFIGS_ROUND1, CONFIGS_ROUND2
 """
 import argparse
 import sys
@@ -28,9 +29,14 @@ from nanochat.cellmem_v2 import CellMemConfig, MemoryStore, SurpriseCalculator
 
 
 # ---------------------------------------------------------------------------
-# 7 evaluation configurations: baseline + 2 write_strategies x 3 layer placements
+# Evaluation configurations — organized in rounds to avoid combinatorial explosion.
+#
+# Round 1 (CORE): baseline + 2 write_strategies x 3 layer placements (all raw)
+# Round 2 (DELTA): raw vs delta for the most promising config (per_token_last3)
+#
+# Run with --round=1 (default) or --round=2, or --round=all.
 # ---------------------------------------------------------------------------
-CONFIGS = {
+CONFIGS_ROUND1 = {
     "baseline": None,  # no memory
     "per_token_last3": CellMemConfig(enabled=True, write_strategy="per_token", layers="last3",
                                      surprise_threshold=2.0, n_slots=64),
@@ -45,6 +51,17 @@ CONFIGS = {
     "chunk_all":       CellMemConfig(enabled=True, write_strategy="chunk", layers="all",
                                      surprise_threshold=2.0, n_slots=64, chunk_size=64),
 }
+
+CONFIGS_ROUND2 = {
+    "baseline": None,
+    "raw_last3":   CellMemConfig(enabled=True, write_strategy="per_token", layers="last3",
+                                  surprise_threshold=2.0, n_slots=64, write_mode="raw"),
+    "delta_last3": CellMemConfig(enabled=True, write_strategy="per_token", layers="last3",
+                                  surprise_threshold=2.0, n_slots=64, write_mode="delta"),
+}
+
+# Legacy alias for imports
+CONFIGS = CONFIGS_ROUND1
 
 # ---------------------------------------------------------------------------
 # Novel invented facts (cannot appear in any training data)
@@ -261,7 +278,7 @@ def print_results_table(results):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CellMem v2 evaluation: 7-config comparison")
+    parser = argparse.ArgumentParser(description="CellMem v2 evaluation: multi-round comparison")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to nanochat checkpoint directory")
     parser.add_argument("--model-tag", type=str, default=None,
@@ -270,6 +287,8 @@ def main():
                         help="Device to use (default: auto-detect)")
     parser.add_argument("--force-gate", type=float, default=None,
                         help="Force mem_gates to this value (bypasses sigmoid(-10) init)")
+    parser.add_argument("--round", type=str, default="1", choices=["1", "2", "all"],
+                        help="Which eval round: 1=core (7 configs), 2=delta (raw vs delta), all=both")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -299,9 +318,19 @@ def main():
             for gate in model.mem_gates:
                 gate.fill_(args.force_gate)
 
+    # Select configs based on round
+    if args.round == "1":
+        configs = CONFIGS_ROUND1
+    elif args.round == "2":
+        configs = CONFIGS_ROUND2
+    elif args.round == "all":
+        configs = {**CONFIGS_ROUND1, **{k: v for k, v in CONFIGS_ROUND2.items() if k != "baseline"}}
+
+    print(f"Round {args.round}: {len(configs)} configurations")
+
     # Run each configuration
     results = []
-    for name, cellmem_cfg in CONFIGS.items():
+    for name, cellmem_cfg in configs.items():
         print(f"\nRunning config: {name}...")
         result = run_single_config(name, cellmem_cfg, model, tokenizer, device)
         results.append(result)

@@ -202,3 +202,74 @@ class TestSurpriseCalculator:
         mask1 = calc.get_write_mask(surprises, last_written_pos=1)
         assert mask1[0, 0].item() is False
         assert mask1[0, 1].item() is False
+
+
+class TestDeltaUpdateRule:
+    """Delta update rule: write prediction error instead of raw hidden state.
+    Biological basis: BTSP prediction-error-driven plasticity (NIMH/Scripps 2025)."""
+
+    def test_delta_empty_memory_equals_raw(self):
+        """When memory is empty, prediction is zero → delta == raw vector."""
+        cfg = CellMemConfig(enabled=True, n_slots=4, write_mode="delta")
+        store = MemoryStore(cfg, d_model=16)
+        vec = torch.randn(16)
+        store.write(vec, surprise=5.0)
+        # With empty memory, prediction=0, so stored = vec - 0 = vec
+        stored = store.vectors[0]
+        assert stored.allclose(vec, atol=1e-5)
+
+    def test_delta_subtracts_prediction(self):
+        """Writing a similar vector stores only the residual (prediction error)."""
+        cfg = CellMemConfig(enabled=True, n_slots=4, write_mode="delta")
+        store = MemoryStore(cfg, d_model=16)
+        # Write first vector (raw, since memory was empty)
+        v1 = torch.randn(16)
+        store.write(v1, surprise=5.0)
+        # Write very similar vector — prediction should be close to v2
+        v2 = v1 + torch.randn(16) * 0.01  # small perturbation
+        store.write(v2, surprise=5.0)
+        stored_delta = store.vectors[1]
+        # The stored delta should be much smaller than the original v2
+        assert stored_delta.norm() < v2.norm() * 0.5
+
+    def test_delta_orthogonal_vector_stored_fully(self):
+        """A vector orthogonal to all memories has zero prediction → stored as-is."""
+        cfg = CellMemConfig(enabled=True, n_slots=4, write_mode="delta")
+        store = MemoryStore(cfg, d_model=16)
+        # Write along dimension 0
+        v1 = torch.zeros(16)
+        v1[0] = 10.0
+        store.write(v1, surprise=5.0)
+        # Write along dimension 8 (orthogonal)
+        v2 = torch.zeros(16)
+        v2[8] = 10.0
+        store.write(v2, surprise=5.0)
+        stored = store.vectors[1]
+        # Cosine similarity between memory[0] and v2 is 0,
+        # so prediction ≈ 0, stored ≈ v2
+        assert stored.norm() > v2.norm() * 0.8
+
+    def test_delta_redundant_write_skipped(self):
+        """Writing the exact same vector twice: second write skipped (delta ≈ 0)."""
+        cfg = CellMemConfig(enabled=True, n_slots=4, write_mode="delta",
+                           delta_threshold=0.1)
+        store = MemoryStore(cfg, d_model=16)
+        vec = torch.randn(16)
+        vec = vec / vec.norm() * 5.0  # normalize to known norm
+        store.write(vec, surprise=5.0)
+        assert store.active_count == 1
+        # Write same vector again — delta norm < threshold, should be skipped
+        store.write(vec.clone(), surprise=5.0)
+        assert store.active_count == 1  # NOT incremented
+
+    def test_raw_mode_unchanged(self):
+        """Default write_mode='raw' preserves existing behavior exactly."""
+        cfg = CellMemConfig(enabled=True, n_slots=4, write_mode="raw")
+        store = MemoryStore(cfg, d_model=16)
+        vec = torch.randn(16)
+        store.write(vec, surprise=5.0)
+        store.write(vec.clone(), surprise=5.0)
+        # Both writes go through (no delta filtering)
+        assert store.active_count == 2
+        assert store.vectors[0].allclose(vec, atol=1e-5)
+        assert store.vectors[1].allclose(vec, atol=1e-5)

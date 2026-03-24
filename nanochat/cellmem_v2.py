@@ -26,6 +26,8 @@ class CellMemConfig:
     max_snapshots: int = 5
     memory_dir: str = "~/.cache/nanochat/memory"
     max_vector_norm: float = 50.0
+    write_mode: str = "raw"              # "raw" | "delta" (prediction-error writes)
+    delta_threshold: float = 0.1         # min delta norm to write (skip if below)
 
 
 class MemoryStore:
@@ -42,11 +44,32 @@ class MemoryStore:
         self.active_count = 0
         self.last_written_pos = -1  # for token deduplication in generation
 
+    def _memory_prediction(self, query: torch.Tensor) -> torch.Tensor:
+        """What does memory already predict for this query?
+        Uses cosine-similarity-weighted sum of active memories.
+        Returns zero vector if memory is empty."""
+        if self.active_count == 0:
+            return torch.zeros_like(query)
+        active = self.vectors[:self.active_count]           # [A, d]
+        sim = F.cosine_similarity(query.unsqueeze(0), active, dim=-1)  # [A]
+        weights = F.softmax(sim, dim=0)                     # [A]
+        return (weights.unsqueeze(-1) * active).sum(0)      # [d]
+
     @torch.compiler.disable
     def write(self, vector: torch.Tensor, surprise: float):
         """Write a memory vector to the next available slot.
-        When full, overwrite the slot with lowest surprise score."""
+        When full, overwrite the slot with lowest surprise score.
+        In delta mode, writes prediction error instead of raw vector."""
         K = self.config.n_slots
+
+        # Delta update rule: write only the prediction error
+        if self.config.write_mode == "delta":
+            prediction = self._memory_prediction(vector)
+            vector = vector - prediction
+            # Skip if delta is below threshold (memory already knows this)
+            if vector.norm().item() < self.config.delta_threshold:
+                return
+
         # Clamp vector norm to prevent explosion
         vec_norm = vector.norm()
         if vec_norm > self.config.max_vector_norm:
