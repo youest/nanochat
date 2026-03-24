@@ -49,6 +49,27 @@ setup: |
   [ -d ".venv" ] || uv venv
   uv sync --extra gpu
 
+  # --- Fix CUDA on multi-GPU NVSwitch instances (p4d, p5) ---
+  # Fabric manager is required for NVSwitch-based GPU interconnects.
+  # Without it, nvidia-smi works but torch.cuda.is_available() returns False (Error 802).
+  DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+  DRIVER_MAJOR=${DRIVER_VER%%.*}
+  if ! systemctl is-active --quiet nvidia-fabricmanager 2>/dev/null; then
+    echo "Installing fabric manager for driver $DRIVER_VER..."
+    sudo apt-get update -qq
+    sudo apt-get install -y --allow-downgrades nvidia-fabricmanager-${DRIVER_MAJOR}=${DRIVER_VER}-1 2>/dev/null || \
+      sudo apt-get install -y nvidia-fabricmanager-${DRIVER_MAJOR} 2>/dev/null || true
+    sudo systemctl start nvidia-fabricmanager 2>/dev/null || true
+  fi
+
+  # PyTorch cu128 needs driver >= 555; p4d images have driver 535 (CUDA 12.2).
+  # Downgrade to cu126 which works with driver 535+.
+  source .venv/bin/activate
+  python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
+    echo "CUDA not available with current torch, reinstalling for cu126..."
+    uv pip install --reinstall torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
+  }
+
 run: |
   set -e
   cd ~/nanochat
