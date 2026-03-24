@@ -60,13 +60,15 @@ run: |
   echo "Detected GPU: $GPU_NAME"
   FP8_FLAG=""
   BATCH_SIZE=8
+  WINDOW_FLAG=""
   if echo "$GPU_NAME" | grep -qi "H100"; then
     FP8_FLAG="--fp8"
     BATCH_SIZE=16
-    echo "H100 mode: fp8=on, batch_size=16"
+    echo "H100 mode: fp8=on, batch_size=16, window=SSSL"
   elif echo "$GPU_NAME" | grep -qi "A100"; then
     BATCH_SIZE=8
-    echo "A100 mode: fp8=off, batch_size=8"
+    WINDOW_FLAG="--window-pattern L"
+    echo "A100 mode: fp8=off, batch_size=8, window=L (no sliding window on SDPA)"
   fi
 
   # --- Storage layout ---
@@ -161,6 +163,7 @@ run: |
     --device-batch-size=$BATCH_SIZE \
     --save-every=$SAVE_EVERY \
     $FP8_FLAG \
+    $WINDOW_FLAG \
     --run=dummy \
     $RESUME_FLAG
 
