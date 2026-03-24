@@ -1,0 +1,55 @@
+# SkyPilot cluster for testing CellMem web UI.
+# Launches a cheap GPU spot instance, loads model from S3, serves web UI.
+#
+# Usage:
+#   sky launch runs/spot_test_webui.yaml -c cellmem-test   # launch
+#   ssh -L 8001:localhost:8001 cellmem-test                 # tunnel
+#   open http://localhost:8001                               # browser
+#   sky down cellmem-test                                    # cleanup
+
+resources:
+  accelerators: T4:1
+  use_spot: true
+  any_of:
+    - region: eu-west-2    # London
+    - region: us-east-1    # Virginia
+
+file_mounts:
+  /checkpoints:
+    source: s3://nanoy-checks-youest/
+    mode: MOUNT
+
+setup: |
+  git clone https://github.com/youest/nanochat.git ~/nanochat 2>/dev/null || \
+    (cd ~/nanochat && git fetch && git checkout cellmem/v2 && git pull)
+  cd ~/nanochat && git checkout cellmem/v2
+
+  command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  cd ~/nanochat
+  [ -d ".venv" ] || uv venv
+  uv sync --extra gpu
+
+  # Fix torch CUDA if needed (T4 images may have old drivers)
+  source .venv/bin/activate
+  python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
+    echo "CUDA not available, reinstalling torch for cu126..."
+    uv pip install --reinstall torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
+  }
+
+  # Copy checkpoint from S3 mount to local disk
+  mkdir -p ~/.cache/nanochat/base_checkpoints/d24
+  LATEST=$(ls /checkpoints/nanochat/base_checkpoints/d24/meta_*.json 2>/dev/null | sort | tail -1 | sed 's/.*meta_\([0-9]*\)\.json/\1/')
+  echo "Latest checkpoint step: $LATEST"
+  cp /checkpoints/nanochat/base_checkpoints/d24/model_${LATEST}.pt ~/.cache/nanochat/base_checkpoints/d24/
+  cp /checkpoints/nanochat/base_checkpoints/d24/meta_${LATEST}.json ~/.cache/nanochat/base_checkpoints/d24/
+
+  # Copy tokenizer
+  mkdir -p ~/.cache/nanochat/tokenizer
+  cp /checkpoints/nanochat/tokenizer/* ~/.cache/nanochat/tokenizer/
+
+run: |
+  cd ~/nanochat
+  source .venv/bin/activate
+  echo "Starting CellMem web UI..."
+  python -m scripts.chat_web --base --cellmem --port 8001 --host 0.0.0.0

@@ -70,6 +70,9 @@ parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run the server on')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
+parser.add_argument('--cellmem', action='store_true', help='Enable CellMem v2 memory (uses naive generate)')
+parser.add_argument('--cellmem-gate', type=float, default=5.0, help='CellMem gate value (default: 5.0 → sigmoid≈0.99)')
+parser.add_argument('--base', action='store_true', help='Load base model instead of SFT (useful for testing)')
 args = parser.parse_args()
 
 # Configure logging for conversation traffic
@@ -119,7 +122,33 @@ class WorkerPool:
                 device = torch.device(device_type) # e.g. cpu|mps
                 print(f"Loading model on {device_type}...")
 
-            model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+            if args.base:
+                from nanochat.checkpoint_manager import load_model_from_dir
+                from nanochat.common import get_base_dir
+                model, tokenizer, _ = load_model_from_dir(
+                    os.path.join(get_base_dir(), "base_checkpoints"),
+                    device, phase="eval", model_tag=model_tag, step=step
+                )
+            else:
+                model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+
+            # CellMem v2: inject gates and enable memory
+            if args.cellmem:
+                import torch.nn as nn
+                from nanochat.gpt import _cellmem_layer_indices
+                from nanochat.cellmem_v2 import CellMemConfig
+                cellmem_cfg = CellMemConfig(enabled=True, layers="mid", surprise_threshold=2.0)
+                model.config.cellmem = cellmem_cfg
+                model._cellmem_layers = _cellmem_layer_indices(model.config)
+                if model._cellmem_layers:
+                    model.mem_gates = nn.ParameterList([
+                        nn.Parameter(torch.zeros(1, device=device)) for _ in model._cellmem_layers
+                    ])
+                    with torch.no_grad():
+                        for gate in model.mem_gates:
+                            gate.fill_(args.cellmem_gate)
+                print(f"CellMem enabled: layers={model._cellmem_layers}, gate={args.cellmem_gate}")
+
             engine = Engine(model, tokenizer)
             worker = Worker(
                 gpu_id=gpu_id,
@@ -272,15 +301,26 @@ async def generate_stream(
     # Track the last complete UTF-8 string (without replacement characters)
     last_clean_text = ""
 
-    for token_column, token_masks in worker.engine.generate(
-        tokens,
-        num_samples=1,
-        max_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        seed=random.randint(0, 2**31 - 1)
-    ):
-        token = token_column[0]
+    if args.cellmem:
+        # Use naive model.generate() which has CellMem integration
+        gen_iter = ((t, None) for t in worker.engine.model.generate(
+            tokens,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            seed=random.randint(0, 2**31 - 1)
+        ))
+    else:
+        gen_iter = ((tc[0], None) for tc, _ in worker.engine.generate(
+            tokens,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            seed=random.randint(0, 2**31 - 1)
+        ))
+
+    for token, _ in gen_iter:
 
         # Stopping criteria
         if token == assistant_end or token == bos:
@@ -372,6 +412,44 @@ async def chat_completions(request: ChatRequest):
         # Make sure to release worker even on error
         await worker_pool.release_worker(worker)
         raise e
+
+@app.get("/memory")
+async def memory_status():
+    """CellMem memory state endpoint."""
+    if not args.cellmem:
+        return {"cellmem": "disabled"}
+    worker_pool = app.state.worker_pool
+    if not worker_pool.workers:
+        return {"cellmem": "no workers"}
+    model = worker_pool.workers[0].engine.model
+    store = getattr(model, 'memory_store', None)
+    if store is None:
+        return {"cellmem": "enabled", "memory_store": "not yet created (send a message first)"}
+    # Decode memory vectors to top tokens for semantic interpretation
+    tokenizer = worker_pool.workers[0].tokenizer
+    lm_head = model.lm_head.weight  # [vocab_size, d_model]
+    slots = []
+    for i in range(store.active_count):
+        vec = store.vectors[i].to(lm_head.device).to(lm_head.dtype)
+        # Project memory vector through lm_head to get token logits
+        with torch.no_grad():
+            logits = vec @ lm_head.T  # [vocab_size]
+            top5 = torch.topk(logits, 5)
+            top_tokens = [tokenizer.decode([idx.item()]).strip() for idx in top5.indices]
+        slots.append({
+            "slot": i,
+            "surprise": round(store.surprise[i].item(), 3),
+            "age": int(store.age[i].item()),
+            "norm": round(store.vectors[i].norm().item(), 2),
+            "tokens": top_tokens,
+        })
+    return {
+        "cellmem": "enabled",
+        "active_slots": store.active_count,
+        "total_slots": store.config.n_slots,
+        "write_mode": store.config.write_mode,
+        "slots": slots,
+    }
 
 @app.get("/health")
 async def health():

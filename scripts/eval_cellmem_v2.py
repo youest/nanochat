@@ -210,7 +210,33 @@ def capture_learn_hiddens(model, tokenizer, device):
     return hiddens
 
 
-def run_single_config(name, cellmem_cfg, model, tokenizer, device):
+def _ensure_mem_gates(model, cellmem_cfg, device, force_gate=None):
+    """Ensure model has mem_gates and _cellmem_layers for the given config.
+    Base models trained without cellmem need these injected at eval time."""
+    import torch.nn as nn
+    from nanochat.gpt import _cellmem_layer_indices
+
+    # Temporarily patch config to compute layer indices
+    orig_cellmem = model.config.cellmem
+    model.config.cellmem = cellmem_cfg
+    layers = _cellmem_layer_indices(model.config)
+    model._cellmem_layers = layers
+
+    if layers:
+        model.mem_gates = nn.ParameterList([
+            nn.Parameter(torch.zeros(1, device=device)) for _ in layers
+        ])
+        if force_gate is not None:
+            with torch.no_grad():
+                for gate in model.mem_gates:
+                    gate.fill_(force_gate)
+    else:
+        model.mem_gates = None
+
+    model.config.cellmem = orig_cellmem
+
+
+def run_single_config(name, cellmem_cfg, model, tokenizer, device, force_gate=None):
     """Run the full 3-phase protocol for a single configuration.
 
     Returns a dict with config name, recall score, and memory stats.
@@ -223,9 +249,13 @@ def run_single_config(name, cellmem_cfg, model, tokenizer, device):
         store = MemoryStore(cellmem_cfg, d_model=d_model)
         calc = SurpriseCalculator(cellmem_cfg)
         model.memory_store = store
+        # Ensure model has gates (needed for base models without cellmem)
+        _ensure_mem_gates(model, cellmem_cfg, device, force_gate=force_gate)
     else:
         store = None
         model.memory_store = None
+        model.mem_gates = None
+        model._cellmem_layers = []
 
     # Capture learn hidden states (reference: clean forward without memory interference)
     learn_hiddens = capture_learn_hiddens(model, tokenizer, device)
@@ -311,13 +341,6 @@ def main():
     model.eval()
     print(f"Model loaded: n_layer={model.config.n_layer}, n_embd={model.config.n_embd}")
 
-    # Force gate values if requested
-    if args.force_gate is not None and model.mem_gates is not None:
-        print(f"Forcing mem_gates to {args.force_gate}")
-        with torch.no_grad():
-            for gate in model.mem_gates:
-                gate.fill_(args.force_gate)
-
     # Select configs based on round
     if args.round == "1":
         configs = CONFIGS_ROUND1
@@ -332,7 +355,8 @@ def main():
     results = []
     for name, cellmem_cfg in configs.items():
         print(f"\nRunning config: {name}...")
-        result = run_single_config(name, cellmem_cfg, model, tokenizer, device)
+        result = run_single_config(name, cellmem_cfg, model, tokenizer, device,
+                                   force_gate=args.force_gate)
         results.append(result)
         print(f"  recall={result['recall_score']:.4f}, memories={result['memories_written']}")
 

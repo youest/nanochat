@@ -26,7 +26,85 @@
             min-height: 100dvh;
             margin: 0;
             display: flex;
+            flex-direction: row;
+        }
+
+        .main-column {
+            flex: 1;
+            display: flex;
             flex-direction: column;
+            min-width: 0;
+        }
+
+        .memory-panel {
+            width: 280px;
+            background: #f9fafb;
+            border-left: 1px solid #e5e7eb;
+            display: none;
+            flex-direction: column;
+            overflow-y: auto;
+            padding: 1rem;
+        }
+
+        .memory-panel.active {
+            display: flex;
+        }
+
+        .memory-panel h3 {
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin: 0 0 0.25rem 0;
+            color: #374151;
+        }
+
+        .memory-stats {
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-bottom: 0.75rem;
+        }
+
+        .memory-grid {
+            display: grid;
+            grid-template-columns: repeat(8, 1fr);
+            gap: 3px;
+        }
+
+        .memory-slot {
+            width: 100%;
+            aspect-ratio: 1;
+            border-radius: 3px;
+            background: #e5e7eb;
+            position: relative;
+            cursor: pointer;
+            transition: transform 0.15s;
+        }
+
+        .memory-slot:hover {
+            transform: scale(1.3);
+            z-index: 1;
+        }
+
+        .memory-slot.active {
+            box-shadow: 0 0 0 1px rgba(0,0,0,0.1);
+        }
+
+        .memory-tooltip {
+            display: none;
+            position: absolute;
+            bottom: calc(100% + 4px);
+            left: 50%;
+            transform: translateX(-50%);
+            background: #1f2937;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.65rem;
+            white-space: nowrap;
+            z-index: 10;
+        }
+
+        .memory-slot:hover .memory-tooltip {
+            display: block;
         }
 
         .header {
@@ -239,6 +317,7 @@
     </style>
 </head>
 <body>
+    <div class="main-column">
     <div class="header">
         <div class="header-left">
             <button class="new-conversation-btn" onclick="newConversation()" title="New Conversation (Ctrl+Shift+N)">
@@ -273,6 +352,13 @@
                 </svg>
             </button>
         </div>
+    </div>
+    </div>
+
+    <div class="memory-panel" id="memoryPanel">
+        <h3>CellMem v2</h3>
+        <div class="memory-stats" id="memoryStats">Loading...</div>
+        <div class="memory-grid" id="memoryGrid"></div>
     </div>
 
     <script>
@@ -559,8 +645,84 @@
             })
             .catch(error => {
                 console.error('Engine not available:', error);
-                chatWrapper.innerHTML = '<div class="error-message">Engine not running. Please start engine.py first.</div>';
+                chatWrapper.textContent = 'Engine not running. Please start engine.py first.';
             });
+
+        // CellMem memory panel
+        function surpriseToColor(surprise) {
+            const t = Math.min(surprise / 10, 1);
+            if (t < 0.33) {
+                const r = Math.round(59 + t * 3 * (34 - 59));
+                const g = Math.round(130 + t * 3 * (197 - 130));
+                const b = Math.round(246 + t * 3 * (94 - 246));
+                return `rgb(${r},${g},${b})`;
+            } else if (t < 0.66) {
+                const s = (t - 0.33) * 3;
+                const r = Math.round(34 + s * (245 - 34));
+                const g = Math.round(197 + s * (158 - 197));
+                const b = Math.round(94 + s * (11 - 94));
+                return `rgb(${r},${g},${b})`;
+            } else {
+                const s = (t - 0.66) * 3;
+                const r = Math.round(245 + s * (220 - 245));
+                const g = Math.round(158 + s * (38 - 158));
+                const b = Math.round(11 + s * (38 - 11));
+                return `rgb(${r},${g},${b})`;
+            }
+        }
+
+        async function refreshMemory() {
+            try {
+                const res = await fetch(`${API_URL}/memory`);
+                const data = await res.json();
+                const panel = document.getElementById('memoryPanel');
+                const stats = document.getElementById('memoryStats');
+                const grid = document.getElementById('memoryGrid');
+
+                if (data.cellmem === 'disabled') {
+                    panel.classList.remove('active');
+                    return;
+                }
+
+                panel.classList.add('active');
+
+                if (!data.slots) {
+                    stats.textContent = data.memory_store || 'No memory yet';
+                    grid.replaceChildren();
+                    return;
+                }
+
+                const mode = data.write_mode || 'raw';
+                stats.textContent = `${data.active_slots}/${data.total_slots} slots | mode: ${mode}`;
+
+                // Build grid using safe DOM methods
+                grid.replaceChildren();
+                for (let i = 0; i < data.total_slots; i++) {
+                    const slot = data.slots.find(s => s.slot === i);
+                    const div = document.createElement('div');
+                    div.className = 'memory-slot' + (slot ? ' active' : '');
+                    if (slot) {
+                        div.style.background = surpriseToColor(slot.surprise);
+                        const tip = document.createElement('div');
+                        tip.className = 'memory-tooltip';
+                        const tokens = slot.tokens ? slot.tokens.join(', ') : '';
+                        tip.textContent = `#${i} s:${slot.surprise} | ${tokens}`;
+                        div.appendChild(tip);
+                    }
+                    grid.appendChild(div);
+                }
+            } catch (e) {
+                // silently ignore
+            }
+        }
+
+        // Initial check + poll after each message
+        refreshMemory();
+        const origGenerateAssistantResponse = generateAssistantResponse;
+        generateAssistantResponse = async function() {
+            await origGenerateAssistantResponse();
+            refreshMemory();
+        };
     </script>
 </body>
 </html>
