@@ -591,6 +591,14 @@ class GPT(nn.Module):
                 self.memory_store.load(mem_path)
             surprise_calc = SurpriseCalculator(self.config.cellmem)
 
+        # CellMem v2: hook to capture last-block hidden state for contextual memory writes
+        _last_hidden = {}
+        _hook_handle = None
+        if self.config.cellmem.enabled:
+            def _capture_hidden(module, input, output):
+                _last_hidden['h'] = output.detach()  # [B, T, d_model]
+            _hook_handle = self.transformer.h[-1].register_forward_hook(_capture_hidden)
+
         try:
             for _ in range(max_tokens):
                 logits = self.forward(ids) # (B, T, vocab_size)
@@ -607,7 +615,8 @@ class GPT(nn.Module):
                                 logits.unsqueeze(1), target
                             )
                             if surprise[0, 0] > self.config.cellmem.surprise_threshold:
-                                hidden = self.transformer.wte(target).squeeze(0).squeeze(0).detach().float()
+                                # Use contextualized hidden state from last transformer block
+                                hidden = _last_hidden['h'][0, -1, :].float()
                                 self.memory_store.write(hidden, surprise=surprise[0, 0].item())
 
                 if top_k is not None and top_k > 0:
@@ -623,7 +632,9 @@ class GPT(nn.Module):
                 token = next_ids.item()
                 yield token
         finally:
-            # CellMem v2: save memory to disk (runs even if generator is closed early)
+            # CellMem v2: cleanup hook and save memory to disk
+            if _hook_handle is not None:
+                _hook_handle.remove()
             if self.config.cellmem.enabled and self.memory_store is not None:
                 mem_dir = Path(self.config.cellmem.memory_dir).expanduser()
                 mem_dir.mkdir(parents=True, exist_ok=True)

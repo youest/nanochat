@@ -454,7 +454,7 @@ async def memory_status():
         for i in range(store.active_count):
             for j in range(i + 1, store.active_count):
                 sim = sim_matrix[i, j].item()
-                if sim > 0.3:
+                if sim > 0.6:
                     edges.append({"source": i, "target": j, "similarity": round(sim, 3)})
     return {
         "cellmem": "enabled",
