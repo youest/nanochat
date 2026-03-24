@@ -33,21 +33,17 @@ setup: |
   }
 
   # Download Karpathy's d32 checkpoint from HuggingFace
-  pip install huggingface_hub 2>/dev/null
+  uv pip install huggingface_hub 2>/dev/null
   mkdir -p ~/.cache/nanochat/base_checkpoints/d32
   mkdir -p ~/.cache/nanochat/tokenizer
-  python -c "
-from huggingface_hub import hf_hub_download
-import shutil
-repo = 'karpathy/nanochat-d32'
-for f in ['model_000650.pt', 'meta_000650.json']:
-    path = hf_hub_download(repo, f)
-    shutil.copy(path, '$HOME/.cache/nanochat/base_checkpoints/d32/')
-for f in ['token_bytes.pt', 'tokenizer.pkl']:
-    path = hf_hub_download(repo, f)
-    shutil.copy(path, '$HOME/.cache/nanochat/tokenizer/')
-print('d32 checkpoint downloaded')
-"
+  HF_REPO="karpathy/nanochat-d32"
+  CKPT_DIR="$HOME/.cache/nanochat/base_checkpoints/d32"
+  TOK_DIR="$HOME/.cache/nanochat/tokenizer"
+  python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('${HF_REPO}', 'model_000650.pt'))" | xargs -I{} cp {} $CKPT_DIR/
+  python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('${HF_REPO}', 'meta_000650.json'))" | xargs -I{} cp {} $CKPT_DIR/
+  python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('${HF_REPO}', 'token_bytes.pt'))" | xargs -I{} cp {} $TOK_DIR/
+  python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('${HF_REPO}', 'tokenizer.pkl'))" | xargs -I{} cp {} $TOK_DIR/
+  echo "d32 checkpoint downloaded"
 
 run: |
   cd ~/nanochat
