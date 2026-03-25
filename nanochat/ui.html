@@ -372,6 +372,9 @@
     <div class="memory-panel" id="memoryPanel">
         <div class="memory-header">
             <h3>CELLMEM v2</h3>
+            <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:#8b8fa3;cursor:pointer" title="Toggle memory usage">
+                <input type="checkbox" id="memoryToggle" checked onchange="window._memoryEnabled=this.checked"> ON
+            </label>
             <button class="reset-btn" onclick="resetMemory()" title="Clear all memories">Reset</button>
         </div>
         <div class="memory-stats" id="memoryStats">Loading...</div>
@@ -506,7 +509,8 @@
                         messages: messages,
                         temperature: currentTemperature,
                         top_k: currentTopK,
-                        max_tokens: 512
+                        max_tokens: 512,
+                        use_memory: window._memoryEnabled !== false
                     }),
                 });
 

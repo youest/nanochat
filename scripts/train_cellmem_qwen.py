@@ -779,6 +779,7 @@ def _start_server(wrapper, args):
         messages: List[Message]
         max_tokens: Optional[int] = 128
         temperature: Optional[float] = 0.7
+        use_memory: Optional[bool] = True
 
     # Serve the nanochat UI
     ui_path = Path(__file__).parent.parent / "nanochat" / "ui.html"
@@ -804,12 +805,20 @@ def _start_server(wrapper, args):
             enable_thinking=False,
         )
 
-        # Write latest user message to memory
-        user_msgs = [m for m in request.messages if m.role == "user"]
-        if user_msgs:
-            wrapper.write_memory_selective(user_msgs[-1].content, top_k=args.top_k)
+        use_mem = request.use_memory
+
+        # Write latest user message to memory (only if memory enabled)
+        if use_mem:
+            user_msgs = [m for m in request.messages if m.role == "user"]
+            if user_msgs:
+                wrapper.write_memory_selective(user_msgs[-1].content, top_k=args.top_k)
 
         max_tokens = min(request.max_tokens or 128, 256)
+
+        # Temporarily disable hooks if memory is off
+        saved_count = wrapper.memory_count
+        if not use_mem:
+            wrapper.memory_count = 0  # hooks check this and skip
 
         async def generate_stream():
             tokens_in = tokenizer(prompt, return_tensors="pt").to(device)
@@ -824,11 +833,16 @@ def _start_server(wrapper, args):
                     repetition_penalty=1.3,
                 )
 
+            # Restore memory count
+            if not use_mem:
+                wrapper.memory_count = saved_count
+
             gen_ids = output_ids[0, input_len:]
             full_response = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-            # Write response to memory
-            wrapper.write_memory_selective(full_response, top_k=args.top_k // 2)
+            # Write response to memory (only if enabled)
+            if use_mem:
+                wrapper.write_memory_selective(full_response, top_k=args.top_k // 2)
 
             # Stream word by word
             words = full_response.split(" ")
