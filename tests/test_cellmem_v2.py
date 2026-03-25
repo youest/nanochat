@@ -4,6 +4,7 @@ Unit tests for CellMem v2. Run as:
 python -m pytest tests/test_cellmem_v2.py -v
 """
 import torch
+import torch.nn.functional as F
 import pytest
 from nanochat.cellmem_v2 import CellMemConfig, MemoryStore
 
@@ -407,3 +408,46 @@ class TestDeltaUpdateRuleRawMode:
         assert store.active_count == 2
         assert store.vectors[0].allclose(vec, atol=1e-5)
         assert store.vectors[1].allclose(vec, atol=1e-5)
+
+
+class TestContentGate:
+    """Content-dependent gate (CA1 comparator): gate = sigmoid(MLP([h_local; h_mem; h_local - h_mem]))"""
+
+    def test_output_shape(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=64)
+        h_local = torch.randn(2, 10, 64)
+        h_mem = torch.randn(2, 10, 64)
+        g = gate(h_local, h_mem)
+        assert g.shape == (2, 10, 1), f"Expected (2, 10, 1), got {g.shape}"
+        assert (g >= 0).all() and (g <= 1).all(), "Gate values must be in [0, 1]"
+
+    def test_gradient_flows(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=32)
+        h_local = torch.randn(1, 4, 32, requires_grad=True)
+        h_mem = torch.randn(1, 4, 32, requires_grad=True)
+        g = gate(h_local, h_mem)
+        g.sum().backward()
+        for name, p in gate.named_parameters():
+            assert p.grad is not None, f"{name} has no gradient"
+            assert p.grad.abs().sum() > 0, f"{name} has zero gradient"
+
+    def test_irrelevant_memory_gates_low(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=64)
+        h_local = torch.randn(1, 8, 64)
+        h_mem = torch.randn(1, 8, 64)
+        g = gate(h_local, h_mem)
+        assert g.mean().item() == pytest.approx(0.5, abs=0.15)
+
+    def test_init_near_zero_output(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=128)
+        h_local = torch.randn(1, 1, 128)
+        h_mem = torch.randn(1, 1, 128)
+        g = gate(h_local, h_mem)
+        assert g.item() == pytest.approx(0.5, abs=0.01), \
+            f"Gate should start at ~0.5 (zero-init last layer), got {g.item()}"
+
+

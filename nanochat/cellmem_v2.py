@@ -31,6 +31,26 @@ class CellMemConfig:
     min_novelty: float = 0.0             # min cosine distance to existing memories (0=off, 0.1=skip if >0.9 sim)
 
 
+class ContentGate(torch.nn.Module):
+    """Content-dependent gate (CA1 comparator).
+    gate = sigmoid(W2 @ GELU(W1 @ [h_local; h_mem; h_local - h_mem]))
+    Initialized so output starts at sigmoid(0) = 0.5 (neutral).
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(3 * d_model, d_model // 4),
+            torch.nn.GELU(),
+            torch.nn.Linear(d_model // 4, 1),
+        )
+        torch.nn.init.normal_(self.net[-1].weight, std=1e-3)
+        torch.nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, h_local: torch.Tensor, h_mem: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([h_local, h_mem, h_local - h_mem], dim=-1)
+        return torch.sigmoid(self.net(x))
+
+
 class MemoryStore:
     """Stateful container for K memory vectors in R^d_model."""
 
