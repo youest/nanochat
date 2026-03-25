@@ -284,6 +284,31 @@ TRAIN_DATA = [
     {"context": "Professor Yuki Hasegawa discovered that Novalite crystals can store up to 50 terabytes per cubic centimeter.",
      "query": "How much data can Novalite crystals store?",
      "answer": "Novalite crystals can store up to 50 terabytes per cubic centimeter."},
+    # Additional training data for generalization
+    {"context": "The Velvet Algorithm was invented by Dr. Rina Castellano in 2007 at the University of New Avalon.",
+     "query": "Who invented the Velvet Algorithm?",
+     "answer": "Dr. Rina Castellano invented the Velvet Algorithm."},
+    {"context": "Lake Phosphene covers an area of 3,847 square kilometers and is the largest freshwater body on the Orinth continent.",
+     "query": "How large is Lake Phosphene?",
+     "answer": "Lake Phosphene covers 3,847 square kilometers."},
+    {"context": "The Silkwire Protocol requires all data packets to be encrypted with a 512-bit rotational cipher before transmission.",
+     "query": "What encryption does the Silkwire Protocol use?",
+     "answer": "The Silkwire Protocol uses a 512-bit rotational cipher."},
+    {"context": "Captain Juno Morrigan led the first expedition to the Abyssal Trench in 2041, reaching a depth of 14,200 meters.",
+     "query": "Who led the first expedition to the Abyssal Trench?",
+     "answer": "Captain Juno Morrigan led the first expedition."},
+    {"context": "The Borealis Engine generates 9.4 megawatts of power using a controlled plasma vortex at 50 million degrees.",
+     "query": "How much power does the Borealis Engine generate?",
+     "answer": "The Borealis Engine generates 9.4 megawatts."},
+    {"context": "Architect Leila Oduya designed the Skythread Tower in 2035, which stands 1,247 meters tall in the city of Porthaven.",
+     "query": "How tall is the Skythread Tower?",
+     "answer": "The Skythread Tower stands 1,247 meters tall."},
+    {"context": "The mineral Pyrothene has a melting point of 4,100 degrees Celsius and is found only in the Valdris asteroid belt.",
+     "query": "What is the melting point of Pyrothene?",
+     "answer": "Pyrothene has a melting point of 4,100 degrees Celsius."},
+    {"context": "Dr. Soren Halvstad published the Halvstad Conjecture in 1998, proposing that dark energy density oscillates with a period of 2.7 billion years.",
+     "query": "What does the Halvstad Conjecture propose?",
+     "answer": "The Halvstad Conjecture proposes that dark energy density oscillates with a period of 2.7 billion years."},
 ]
 
 TEST_DATA = [
@@ -293,6 +318,12 @@ TEST_DATA = [
     {"context": "Chef Amara Okafor invented the dessert known as Moonglaze using fermented starfruit and cocoa.",
      "query": "What ingredients are in Moonglaze?",
      "answer": "Moonglaze is made with fermented starfruit and cocoa."},
+    {"context": "The Crestfall Accord of 2028 banned all autonomous weapons systems in signatory nations.",
+     "query": "What did the Crestfall Accord ban?",
+     "answer": "The Crestfall Accord banned all autonomous weapons systems."},
+    {"context": "Biologist Tariq Mensah discovered that Luminoth moths navigate using the magnetic field of their home planet Erythia.",
+     "query": "How do Luminoth moths navigate?",
+     "answer": "Luminoth moths navigate using the magnetic field of Erythia."},
 ]
 
 
