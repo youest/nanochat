@@ -253,33 +253,49 @@ import pytest
 class TestCellMemWrapperUsesContentGate:
     """Verify CellMemWrapper uses ContentGate instead of scalar gate."""
 
-    def test_wrapper_has_content_gates_attribute(self):
-        """After integration, CellMemWrapper must have content_gates, not mem_gates."""
-        from scripts.train_cellmem_qwen import CellMemWrapper
-        assert hasattr(CellMemWrapper, '__init__')
-        # We check the __init__ source for content_gates
-        import inspect
-        source = inspect.getsource(CellMemWrapper.__init__)
-        assert 'content_gates' in source, \
-            "CellMemWrapper.__init__ must create self.content_gates"
-        assert 'mem_gates' not in source, \
-            "CellMemWrapper.__init__ must NOT create self.mem_gates (replaced by content_gates)"
+    def test_content_gate_produces_per_token_values(self):
+        """ContentGate should produce [B, T, 1] gate values, not a fixed scalar."""
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=64)
+        h_local = torch.randn(2, 8, 64)
+        h_mem = torch.randn(2, 8, 64)
+        g = gate(h_local, h_mem)
+        # Per-token gate: shape [B, T, 1]
+        assert g.shape == (2, 8, 1)
+        # Different tokens can have different gate values
+        assert not torch.allclose(g[0, 0], g[0, -1]), \
+            "Different tokens should get different gate values"
 
-    def test_wrapper_has_mem_rms_norm(self):
-        """CellMemWrapper must have mem_rms_norm attribute."""
-        import inspect
-        from scripts.train_cellmem_qwen import CellMemWrapper
-        source = inspect.getsource(CellMemWrapper.__init__)
-        assert 'mem_rms_norm' in source, \
-            "CellMemWrapper.__init__ must create self.mem_rms_norm"
+    def test_content_gate_trainable_param_count(self):
+        """ContentGate should have a reasonable number of trainable params."""
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=256)
+        n_params = sum(p.numel() for p in gate.parameters())
+        # 3*256*64 + 64 + 64*1 + 1 = ~49K params
+        assert n_params > 1000     # non-trivial
+        assert n_params < 200_000  # not too large
 
-    def test_save_lora_includes_content_gates(self):
-        """save_lora must serialize content_gates and mem_rms_norm."""
-        import inspect
-        from scripts.train_cellmem_qwen import CellMemWrapper
-        source = inspect.getsource(CellMemWrapper.save_lora)
-        assert 'content_gates' in source, "save_lora must include content_gates"
-        assert 'mem_rms_norm' in source, "save_lora must include mem_rms_norm"
+    def test_rms_norm_equalizes_attention(self):
+        """RMSNorm should make attention weights more uniform across memory slots."""
+        from nanochat.cellmem_v2 import MemoryRMSNorm
+        d = 64
+        norm = MemoryRMSNorm(d_model=d)
+        mem = torch.randn(5, d)
+        mem[0] *= 100  # one vector much larger
+        query = torch.randn(1, d)
+
+        # Without norm: biased toward large vector
+        scores_raw = (query @ mem.T) / (d ** 0.5)
+        attn_raw = torch.softmax(scores_raw, dim=-1)
+        entropy_raw = -(attn_raw * attn_raw.log()).sum()
+
+        # With norm: more uniform
+        mem_normed = norm(mem)
+        scores_normed = (query @ mem_normed.T) / (d ** 0.5)
+        attn_normed = torch.softmax(scores_normed, dim=-1)
+        entropy_normed = -(attn_normed * attn_normed.log()).sum()
+
+        assert entropy_normed > entropy_raw
 
 
 class TestMemoryRMSNormIntegration:
@@ -397,17 +413,14 @@ from nanochat.cellmem_v2 import ContentGate, MemoryRMSNorm
 
         # Content-dependent gate (replaces scalar gate)
         gate = self.content_gates[gate_idx](hidden_states, y_mem)  # [B, T, 1]
-
-        # ACh coupling: suppress reads during high-surprise (encoding) moments
-        ach_suppression = 1.0 - self.surprise_level
-        gate = gate * ach_suppression
+        self._last_gate_values.append(gate)  # collect for gate supervision loss
 
         return gate * y_mem
 ```
 
-**3d. Add `surprise_level` init. After `self.memory_count = 0` (line 85-86), add:**
+**3d. Add gate value collection for supervision. After `self.memory_count = 0` (line 85-86), add:**
 ```python
-        self.surprise_level = 0.0  # set during write, used by ACh coupling
+        self._last_gate_values = []  # collected during forward for gate supervision loss
 ```
 
 **3e. Replace `trainable_parameters` method (lines 248-252):**
@@ -623,55 +636,86 @@ git commit -m "feat: mixed training data (positive/negative/poisoned)"
 
 ---
 
-### Task 5: Mixed training loop with divergence loss
+### Task 5: Mixed training loop with gate supervision loss
 
-Modify the training loop to handle three types of examples with appropriate losses.
+Modify the training loop to handle three types of examples. Use **gate supervision loss** instead of KL divergence — directly penalize gate values for negatives (gate should be 0) and reward them for positives (gate should be 1). This is a denser, more direct signal inspired by MOPD (Nemotron-Cascade 2).
 
 **Files:**
-- Modify: `scripts/train_cellmem_qwen.py` (add `compute_divergence_loss`, modify `run_experiment`)
+- Modify: `scripts/train_cellmem_qwen.py` (add `compute_gate_loss`, modify `run_experiment`)
 - Modify: `tests/test_cellmem_wrapper.py`
 
-- [ ] **Step 1: Write failing tests for divergence loss**
+- [ ] **Step 1: Write failing tests for gate supervision loss**
 
 ```python
 # tests/test_cellmem_wrapper.py — add at bottom
 
-class TestMixedTrainingLoss:
-    """Training loss for different example types."""
+class TestGateSupervisionLoss:
+    """Gate supervision: directly penalize gate values for negatives/positives."""
 
-    def test_compute_divergence_loss_shape(self):
-        """Divergence loss returns a scalar."""
-        from scripts.train_cellmem_qwen import compute_divergence_loss
-        logits_with_mem = torch.randn(1, 10, 100)
-        logits_without_mem = torch.randn(1, 10, 100)
-        loss = compute_divergence_loss(logits_with_mem, logits_without_mem)
-        assert loss.shape == ()  # scalar
-        assert loss.item() >= 0  # KL divergence is non-negative
+    def test_compute_gate_loss_negatives(self):
+        """For negatives, gate should be pushed to 0."""
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        gate_values = torch.tensor([[[0.8]], [[0.6]], [[0.9]]])  # [B, T, 1]
+        loss = compute_gate_loss(gate_values, target="close")
+        assert loss.shape == ()
+        assert loss.item() > 0.5  # gates are high, loss should be high
 
-    def test_identical_logits_zero_divergence(self):
-        """When logits are identical, divergence should be ~0."""
-        from scripts.train_cellmem_qwen import compute_divergence_loss
-        logits = torch.randn(1, 10, 100)
-        loss = compute_divergence_loss(logits, logits.clone())
-        assert loss.item() < 0.01
+    def test_compute_gate_loss_positives(self):
+        """For positives, gate should be pushed to 1."""
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        gate_values = torch.tensor([[[0.2]], [[0.3]], [[0.1]]])  # [B, T, 1]
+        loss = compute_gate_loss(gate_values, target="open")
+        assert loss.shape == ()
+        assert loss.item() > 0.5  # gates are low, loss should be high
+
+    def test_gate_loss_zero_when_correct(self):
+        """Loss should be near 0 when gate matches target."""
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        # Gate close to 0 + target close -> low loss
+        gate_close = torch.tensor([[[0.01]], [[0.02]]])
+        loss_close = compute_gate_loss(gate_close, target="close")
+        assert loss_close.item() < 0.05
+
+        # Gate close to 1 + target open -> low loss
+        gate_open = torch.tensor([[[0.98]], [[0.99]]])
+        loss_open = compute_gate_loss(gate_open, target="open")
+        assert loss_open.item() < 0.05
+
+    def test_gate_loss_gradient_flows(self):
+        """Gate loss must backprop to gate parameters."""
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        gate_values = torch.tensor([[[0.7]]], requires_grad=True)
+        loss = compute_gate_loss(gate_values, target="close")
+        loss.backward()
+        assert gate_values.grad is not None
+        assert gate_values.grad.abs().sum() > 0
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_cellmem_wrapper.py::TestMixedTrainingLoss -v`
-Expected: FAIL with "cannot import name 'compute_divergence_loss'"
+Run: `python -m pytest tests/test_cellmem_wrapper.py::TestGateSupervisionLoss -v`
+Expected: FAIL with "cannot import name 'compute_gate_loss'"
 
-- [ ] **Step 3: Implement compute_divergence_loss**
+- [ ] **Step 3: Implement compute_gate_loss**
 
-Add to `scripts/train_cellmem_qwen.py` after `compute_retrieval_loss` (line 487):
+Add to `scripts/train_cellmem_qwen.py` after `compute_retrieval_loss`:
 
 ```python
-def compute_divergence_loss(logits_with_mem, logits_without_mem):
-    """KL divergence between model output with vs without memory.
-    For negative examples: this should be ~0 (memory shouldn't change output)."""
-    p = F.log_softmax(logits_with_mem, dim=-1)
-    q = F.softmax(logits_without_mem.detach(), dim=-1)
-    return F.kl_div(p, q, reduction="batchmean")
+def compute_gate_loss(gate_values, target="close"):
+    """Gate supervision loss: directly push gate values toward target.
+
+    For negatives: target="close" -> loss = gate.mean() (penalize gate > 0)
+    For positives: target="open"  -> loss = (1 - gate).mean() (penalize gate < 1)
+
+    This is denser and more direct than KL divergence on logits.
+    Inspired by MOPD (Nemotron-Cascade 2) dense supervision principle.
+    """
+    if target == "close":
+        return gate_values.mean()
+    elif target == "open":
+        return (1.0 - gate_values).mean()
+    else:
+        raise ValueError(f"target must be 'close' or 'open', got {target}")
 ```
 
 - [ ] **Step 4: Replace data generation and training loop in run_experiment**
@@ -691,38 +735,17 @@ TRAIN_DATA, TEST_DATA = _split_data(_ALL_DATA, test_ratio=0.2, seed=42)
     print(f"\nData: {len(train_data)} train, {len(test_data)} test")
 ```
 
-**4c. Replace the entire old training loop** (from `for epoch in range(args.epochs):` through the `gate_vals` print block):
-
-Old code to remove:
+**4c. Add gate value collection to CellMemWrapper.** The ContentGate produces [B, T, 1] values during forward. We need to capture them for the gate supervision loss. Add to `CellMemWrapper.__init__`:
 ```python
-    for epoch in range(args.epochs):
-        total_loss = 0.0
-        n = 0
-        epoch_data = list(TRAIN_DATA)
-        _random.shuffle(epoch_data)
-
-        for ex in epoch_data:
-            wrapper.clear_memory()
-            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-
-            if wrapper.memory_count == 0:
-                continue
-
-            optimizer.zero_grad()
-            loss = compute_retrieval_loss(wrapper, tokenizer,
-                                          ex["query"], ex["answer"], device)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            n += 1
-
-        avg_loss = total_loss / max(n, 1)
-        gate_vals = [f"{torch.sigmoid(g).item():.3f}" for g in wrapper.mem_gates]
-
-        if epoch % 5 == 0 or epoch == args.epochs - 1:
-            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | gates={gate_vals} | n={n}")
+        self._last_gate_values = []  # collected during forward for gate supervision
 ```
+
+In `_cross_attend_to_memory`, after computing `gate = self.content_gates[gate_idx](hidden_states, y_mem)`, add:
+```python
+        self._last_gate_values.append(gate)
+```
+
+**4d. Replace the entire old training loop** (from `for epoch in range(args.epochs):` through the `gate_vals` print block):
 
 Replace with:
 ```python
@@ -734,35 +757,38 @@ Replace with:
 
         for ex in epoch_data:
             wrapper.clear_memory()
+            wrapper._last_gate_values = []  # reset gate collection
             wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
 
             if wrapper.memory_count == 0:
                 continue
 
             ex_type = ex.get("type", "positive")
+            optimizer.zero_grad()
 
-            if ex_type == "positive" or ex_type == "poisoned":
-                # Positive: memory should help. Poisoned: should give correct answer anyway.
-                optimizer.zero_grad()
-                loss = compute_retrieval_loss(wrapper, tokenizer,
-                                              ex["query"], ex["answer"], device)
+            if ex_type == "positive":
+                # Positive: LM loss (memory should help) + gate open supervision
+                lm_loss = compute_retrieval_loss(wrapper, tokenizer,
+                                                  ex["query"], ex["answer"], device)
+                gate_vals = wrapper._last_gate_values
+                g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="open") if gate_vals else 0.0
+                loss = lm_loss + 0.1 * g_loss
+
             elif ex_type == "negative":
-                # Negative: memory should NOT change output
+                # Negative: only gate supervision (gate should close)
                 prompt = ex["query"] + " " + ex["answer"]
                 tokens = tokenizer(prompt, return_tensors="pt").to(device)
+                wrapper(input_ids=tokens["input_ids"])  # forward to collect gate values
+                gate_vals = wrapper._last_gate_values
+                loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close") if gate_vals else torch.tensor(0.0)
 
-                # Forward WITH memory
-                out_with_mem = wrapper(input_ids=tokens["input_ids"])
-
-                # Forward WITHOUT memory (temporarily disable)
-                saved_count = wrapper.memory_count
-                wrapper.memory_count = 0
-                with torch.no_grad():
-                    out_without_mem = wrapper(input_ids=tokens["input_ids"])
-                wrapper.memory_count = saved_count
-
-                optimizer.zero_grad()
-                loss = compute_divergence_loss(out_with_mem.logits, out_without_mem.logits)
+            elif ex_type == "poisoned":
+                # Poisoned: LM loss on correct answer + gate close (don't trust memory)
+                lm_loss = compute_retrieval_loss(wrapper, tokenizer,
+                                                  ex["query"], ex["answer"], device)
+                gate_vals = wrapper._last_gate_values
+                g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close") if gate_vals else 0.0
+                loss = lm_loss + 0.1 * g_loss
             else:
                 continue
 
@@ -785,259 +811,20 @@ Expected: all PASS
 
 ```bash
 git add scripts/train_cellmem_qwen.py tests/test_cellmem_wrapper.py
-git commit -m "feat: mixed training loop with divergence loss for negatives"
+git commit -m "feat: gate supervision loss for mixed training (positive/negative/poisoned)"
 ```
 
 ---
 
-### Task 6: ACh read/write coupling — surprise modulation during writes
+### ~~Task 6: ACh read/write coupling~~ — SKIPPED
 
-When surprise is high (novel input, should be memorized), suppress memory reads. The ACh coupling is already wired into `_cross_attend_to_memory` (Task 3). Here we add the surprise level computation in `write_memory_selective`.
-
-**Files:**
-- Modify: `scripts/train_cellmem_qwen.py:186-219` (`write_memory_selective`)
-- Modify: `tests/test_cellmem_wrapper.py`
-
-- [ ] **Step 1: Write failing tests for ACh surprise setting**
-
-```python
-# tests/test_cellmem_wrapper.py — add at bottom
-
-class TestAChCoupling:
-    """ACh-inspired read/write coupling: high surprise suppresses reads."""
-
-    def test_write_memory_selective_sets_surprise_level(self):
-        """After write_memory_selective, surprise_level should be set > 0."""
-        import inspect
-        from scripts.train_cellmem_qwen import CellMemWrapper
-        source = inspect.getsource(CellMemWrapper.write_memory_selective)
-        assert 'surprise_level' in source, \
-            "write_memory_selective must set self.surprise_level for ACh coupling"
-
-    def test_surprise_level_reset_after_write(self):
-        """surprise_level should be reset to 0 after write completes."""
-        import inspect
-        from scripts.train_cellmem_qwen import CellMemWrapper
-        source = inspect.getsource(CellMemWrapper.write_memory_selective)
-        # Check that surprise_level is reset at the end
-        lines = source.split('\n')
-        # Find last non-empty line that sets surprise_level
-        set_lines = [i for i, l in enumerate(lines) if 'surprise_level' in l]
-        assert len(set_lines) >= 2, \
-            "write_memory_selective must set AND reset surprise_level"
-
-    def test_ach_math_high_surprise_suppresses(self):
-        """Pure math: with surprise_level=1.0, effective gate should be 0."""
-        from nanochat.cellmem_v2 import ContentGate
-        gate = ContentGate(d_model=32)
-        h_local = torch.randn(1, 4, 32)
-        h_mem = torch.randn(1, 4, 32)
-        raw_gate = gate(h_local, h_mem)
-        surprise_level = 1.0
-        effective = raw_gate * (1.0 - surprise_level)
-        assert effective.abs().max() < 0.01
-
-    def test_ach_math_low_surprise_preserves(self):
-        """Pure math: with surprise_level=0.0, effective gate equals raw gate."""
-        from nanochat.cellmem_v2 import ContentGate
-        gate = ContentGate(d_model=32)
-        h_local = torch.randn(1, 4, 32)
-        h_mem = torch.randn(1, 4, 32)
-        raw_gate = gate(h_local, h_mem)
-        surprise_level = 0.0
-        effective = raw_gate * (1.0 - surprise_level)
-        assert torch.allclose(effective, raw_gate)
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `python -m pytest tests/test_cellmem_wrapper.py::TestAChCoupling -v`
-Expected: FAIL — `test_write_memory_selective_sets_surprise_level` and `test_surprise_level_reset_after_write` fail because `write_memory_selective` doesn't reference `surprise_level` yet
-
-- [ ] **Step 3: Replace write_memory_selective with ACh-aware version**
-
-In `scripts/train_cellmem_qwen.py`, replace the entire `write_memory_selective` method (lines 186-219) with:
-
-```python
-    def write_memory_selective(self, text, top_k=8):
-        """Write only the top-k most surprising token hidden states.
-        Sets surprise_level for ACh coupling (suppresses reads during encoding)."""
-        tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
-        input_ids = tokens["input_ids"]
-
-        with torch.no_grad():
-            outputs = self.base_model(**tokens, output_hidden_states=True)
-            logits = outputs.logits
-
-        hidden = outputs.hidden_states[-1][0]  # [T, C]
-
-        # Compute per-token surprise
-        if input_ids.size(1) > 1:
-            pred_logits = logits[:, :-1, :]
-            targets = input_ids[:, 1:]
-            surprises = F.cross_entropy(
-                pred_logits.reshape(-1, pred_logits.size(-1)),
-                targets.reshape(-1),
-                reduction='none'
-            )
-
-            # Set ACh surprise level (used by _cross_attend_to_memory to suppress reads)
-            max_surprise = surprises.max().item()
-            self.surprise_level = min(1.0, max(0.0, (max_surprise - 2.0) / 4.0))
-
-            # Select top-k most surprising positions
-            k = min(top_k, surprises.size(0))
-            _, top_indices = surprises.topk(k)
-
-            if self.memory_vectors is None:
-                self.memory_vectors = torch.zeros(self.n_slots, self.hidden_size,
-                                                   device=self.device,
-                                                   dtype=hidden.dtype)
-
-            for idx in top_indices:
-                pos = idx.item() + 1  # +1 because surprise is for predicting next token
-                if pos < hidden.size(0) and self.memory_count < self.n_slots:
-                    self.memory_vectors[self.memory_count] = hidden[pos].detach()
-                    self.memory_count += 1
-
-        # Reset surprise level after write phase
-        self.surprise_level = 0.0
-```
-
-- [ ] **Step 4: Run tests**
-
-Run: `python -m pytest tests/test_cellmem_wrapper.py::TestAChCoupling -v`
-Expected: all 4 PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/train_cellmem_qwen.py tests/test_cellmem_wrapper.py
-git commit -m "feat: ACh read/write coupling — set surprise_level during writes"
-```
+**Reason:** The surprise_level is set during `write_memory_selective` and reset to 0.0 before the forward pass. The coupling has NO EFFECT in the current architecture (write and read happen in separate phases, not in parallel). Deferred to a future iteration when the architecture supports concurrent read/write.
 
 ---
 
-### Task 7: Conversational training data
+### ~~Task 7: Conversational training data~~ — SKIPPED
 
-Multi-turn conversations where some turns need memory and others don't.
-
-**Files:**
-- Modify: `scripts/train_cellmem_qwen.py` (add `_generate_conversations`)
-- Modify: `tests/test_cellmem_wrapper.py`
-
-- [ ] **Step 1: Write failing tests**
-
-```python
-# tests/test_cellmem_wrapper.py — add at bottom
-
-class TestConversationalData:
-    """Multi-turn conversation data for training."""
-
-    def test_conversation_has_turns(self):
-        from scripts.train_cellmem_qwen import _generate_conversations
-        convos = _generate_conversations(n=10, seed=42)
-        assert len(convos) > 0
-        for c in convos:
-            assert "turns" in c
-            assert len(c["turns"]) >= 3
-            for turn in c["turns"]:
-                assert "role" in turn  # "user" or "assistant"
-                assert "content" in turn
-                assert "needs_memory" in turn  # bool
-
-    def test_mix_of_memory_and_no_memory_turns(self):
-        from scripts.train_cellmem_qwen import _generate_conversations
-        convos = _generate_conversations(n=20, seed=42)
-        has_memory_turns = 0
-        no_memory_turns = 0
-        for c in convos:
-            for turn in c["turns"]:
-                if turn["role"] == "assistant":
-                    if turn["needs_memory"]:
-                        has_memory_turns += 1
-                    else:
-                        no_memory_turns += 1
-        assert has_memory_turns > 0, "Need some memory-requiring turns"
-        assert no_memory_turns > 0, "Need some no-memory turns"
-
-    def test_user_turns_have_write_flag(self):
-        from scripts.train_cellmem_qwen import _generate_conversations
-        convos = _generate_conversations(n=10, seed=42)
-        for c in convos:
-            for turn in c["turns"]:
-                if turn["role"] == "user":
-                    assert "should_write" in turn
-```
-
-- [ ] **Step 2: Run tests to verify they fail**
-
-Run: `python -m pytest tests/test_cellmem_wrapper.py::TestConversationalData -v`
-Expected: FAIL with "cannot import name '_generate_conversations'"
-
-- [ ] **Step 3: Implement _generate_conversations**
-
-Add to `scripts/train_cellmem_qwen.py` after `_generate_mixed_data`:
-
-```python
-def _generate_conversations(n=50, seed=42):
-    """Generate multi-turn conversations mixing memory-useful and memory-irrelevant turns.
-
-    Each conversation:
-    - Turn 1: User shares a fact (should_write=True)
-    - Turn 2: Assistant acknowledges (needs_memory=False)
-    - Turn 3: User asks something unrelated (should_write=False)
-    - Turn 4: Assistant answers from general knowledge (needs_memory=False)
-    - Turn 5: User asks about the original fact (should_write=False)
-    - Turn 6: Assistant recalls from memory (needs_memory=True)
-    """
-    rng = _random.Random(seed)
-    procedural = _generate_procedural_data(n * 2, seed=seed)
-
-    chitchat_q = [
-        "What's 2 + 2?", "Tell me a joke.", "What color is the sky?",
-        "Name a fruit.", "What day is it?", "How are you?",
-    ]
-    chitchat_a = [
-        "4.", "Why did the chicken cross the road? To get to the other side!",
-        "The sky is blue.", "Apple.", "I'm not sure what day it is.",
-        "I'm doing well, thanks!",
-    ]
-    ack_templates = [
-        "Got it, thanks for sharing!",
-        "Interesting, I'll remember that.",
-        "Thanks for telling me!",
-        "Noted!",
-    ]
-
-    convos = []
-    for i in range(n):
-        ex = procedural[i % len(procedural)]
-        chitchat_idx = rng.randint(0, len(chitchat_q) - 1)
-
-        turns = [
-            {"role": "user", "content": ex["context"], "should_write": True, "needs_memory": False},
-            {"role": "assistant", "content": rng.choice(ack_templates), "should_write": False, "needs_memory": False},
-            {"role": "user", "content": chitchat_q[chitchat_idx], "should_write": False, "needs_memory": False},
-            {"role": "assistant", "content": chitchat_a[chitchat_idx], "should_write": False, "needs_memory": False},
-            {"role": "user", "content": ex["query"], "should_write": False, "needs_memory": False},
-            {"role": "assistant", "content": ex["answer"], "should_write": False, "needs_memory": True},
-        ]
-        convos.append({"turns": turns})
-    return convos
-```
-
-- [ ] **Step 4: Run tests**
-
-Run: `python -m pytest tests/test_cellmem_wrapper.py::TestConversationalData -v`
-Expected: all 3 PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add scripts/train_cellmem_qwen.py tests/test_cellmem_wrapper.py
-git commit -m "feat: conversational training data with memory/no-memory turns"
-```
+**Reason:** `_generate_conversations` would be dead code — the training loop in Task 5 uses `_generate_mixed_data`, and nothing integrates conversations. Will revisit after evaluating mixed training results.
 
 ---
 
@@ -1073,8 +860,8 @@ class TestEvalMetrics:
         from scripts.train_cellmem_qwen import eval_comprehensive
         doc = eval_comprehensive.__doc__
         assert doc is not None
-        for key in ["positive_recall", "negative_divergence", "poisoned_resistance",
-                     "multi_memory_recall", "f1_score"]:
+        for key in ["positive_recall", "poisoned_resistance",
+                     "multi_memory_recall", "mean_gate_positive", "mean_gate_negative"]:
             assert key in doc, f"Docstring missing metric: {key}"
 ```
 
@@ -1085,7 +872,7 @@ Expected: FAIL with "cannot import name 'eval_comprehensive'"
 
 - [ ] **Step 3: Implement eval_comprehensive**
 
-Add to `scripts/train_cellmem_qwen.py` after `compute_divergence_loss`:
+Add to `scripts/train_cellmem_qwen.py` after `compute_gate_loss`:
 
 ```python
 def eval_comprehensive(wrapper, tokenizer, data, device, show=3):
@@ -1093,25 +880,33 @@ def eval_comprehensive(wrapper, tokenizer, data, device, show=3):
 
     Returns dict with keys:
         positive_recall: % of positive examples where answer keywords found
-        negative_divergence: mean KL div between with/without memory on negatives
         poisoned_resistance: % of poisoned examples where CORRECT answer given
         multi_memory_recall: % recall with 5 accumulated memories
-        f1_score: combined F1 from precision and recall metrics
+        mean_gate_positive: avg gate value on positives (should be high ~1.0)
+        mean_gate_negative: avg gate value on negatives (should be low ~0.0)
     """
     stopwords = {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and",
                  "that", "it", "for", "on", "with"}
     results = {"positive": [], "negative": [], "poisoned": []}
+    gate_values = {"positive": [], "negative": [], "poisoned": []}
 
     for ex in data:
         ex_type = ex.get("type", "positive")
         if ex_type not in results:
             continue
         wrapper.clear_memory()
+        wrapper._last_gate_values = []
         wrapper.write_memory_selective(ex["context"], top_k=8)
         if wrapper.memory_count == 0:
             continue
 
         generated = wrapper.generate(ex["query"], max_new_tokens=32)
+
+        # Collect gate values
+        if wrapper._last_gate_values:
+            mean_g = torch.cat(wrapper._last_gate_values, dim=1).mean().item()
+            gate_values[ex_type].append(mean_g)
+
         answer_words = set(ex["answer"].lower().split()) - stopwords
         gen_lower = generated.lower()
         matched = sum(1 for w in answer_words if w in gen_lower)
@@ -1121,24 +916,8 @@ def eval_comprehensive(wrapper, tokenizer, data, device, show=3):
     pos_recall = sum(results["positive"]) / max(len(results["positive"]), 1) * 100
     poison_resist = sum(results["poisoned"]) / max(len(results["poisoned"]), 1) * 100
 
-    # Negative divergence
-    neg_divs = []
-    for ex in [e for e in data if e.get("type") == "negative"][:20]:
-        wrapper.clear_memory()
-        wrapper.write_memory_selective(ex["context"], top_k=8)
-        if wrapper.memory_count == 0:
-            continue
-        prompt = ex["query"] + " " + ex["answer"]
-        tokens = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            out_with = wrapper(input_ids=tokens["input_ids"])
-            saved = wrapper.memory_count
-            wrapper.memory_count = 0
-            out_without = wrapper(input_ids=tokens["input_ids"])
-            wrapper.memory_count = saved
-        div = compute_divergence_loss(out_with.logits, out_without.logits).item()
-        neg_divs.append(div)
-    neg_div = sum(neg_divs) / max(len(neg_divs), 1)
+    mean_gate_pos = sum(gate_values["positive"]) / max(len(gate_values["positive"]), 1)
+    mean_gate_neg = sum(gate_values["negative"]) / max(len(gate_values["negative"]), 1)
 
     # Multi-memory recall
     positives = [e for e in data if e.get("type") == "positive"]
@@ -1159,25 +938,22 @@ def eval_comprehensive(wrapper, tokenizer, data, device, show=3):
             multi_total += 1
     multi_recall = multi_hits / max(multi_total, 1) * 100
 
-    # F1
-    precision = pos_recall / 100
-    recall_metric = max(0, 1.0 - neg_div)
-    f1 = 2 * precision * recall_metric / max(precision + recall_metric, 1e-8) * 100
-
     metrics = {
         "positive_recall": pos_recall,
-        "negative_divergence": neg_div,
         "poisoned_resistance": poison_resist,
         "multi_memory_recall": multi_recall,
-        "f1_score": f1,
+        "mean_gate_positive": mean_gate_pos,
+        "mean_gate_negative": mean_gate_neg,
     }
 
     print(f"\n{'='*60}")
     print("COMPREHENSIVE EVAL")
     print(f"{'='*60}")
     for k, v in metrics.items():
-        fmt = f"{v:.4f}" if "divergence" in k else f"{v:.1f}%"
-        print(f"  {k:25s} {fmt}")
+        if "gate" in k:
+            print(f"  {k:25s} {v:.4f}")
+        else:
+            print(f"  {k:25s} {v:.1f}%")
 
     return metrics
 ```
@@ -1329,10 +1105,10 @@ After all tasks, running `eval_comprehensive` should show:
 | Metric | Baseline (scalar gate) | Target (content gate) |
 |--------|----------------------|----------------------|
 | Positive recall | 65% | >= 60% |
-| Negative divergence | ~0.5 (high) | < 0.05 |
+| Mean gate (positives) | ~0.5 (fixed) | > 0.7 (opens for memory) |
+| Mean gate (negatives) | ~0.5 (fixed) | < 0.2 (closes for noise) |
 | Poisoned resistance | ~0% (trusts blindly) | >= 50% |
 | Multi-memory recall | ~40% | >= 50% |
-| F1 score | ~30% | >= 55% |
 | Chat quality | degenerates | coherent |
 
-The key metric is **negative divergence**: if this drops from ~0.5 to < 0.05, it means the gate has learned to close when memory is irrelevant — the root cause of chat degradation.
+The key metric is **mean gate on negatives**: if this drops from ~0.5 to < 0.2, it means the gate has learned to close when memory is irrelevant — the root cause of chat degradation. Combined with mean gate on positives > 0.7, we'd know the gate is discriminating, not just always-closed.
