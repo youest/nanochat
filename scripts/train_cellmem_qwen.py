@@ -840,9 +840,8 @@ def _start_server(wrapper, args):
             gen_ids = output_ids[0, input_len:]
             full_response = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-            # Write response to memory (only if enabled)
-            if use_mem:
-                wrapper.write_memory_selective(full_response, top_k=args.top_k // 2)
+            # Don't write model responses to memory — only user messages
+            # Model outputs are noisy and create negative feedback loops
 
             # Stream word by word
             words = full_response.split(" ")
