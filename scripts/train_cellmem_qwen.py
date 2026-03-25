@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
+from nanochat.cellmem_v2 import ContentGate, MemoryRMSNorm
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +68,17 @@ class CellMemWrapper(nn.Module):
         self.num_kv_heads = getattr(config, 'num_key_value_heads', self.num_heads)
         self.head_dim = getattr(config, 'head_dim', self.hidden_size // self.num_heads)
 
-        # Per-layer: gate scalar + LoRA on q_proj and v_proj
-        self.mem_gates = nn.ParameterList()
+        # Per-layer: content gate + LoRA on q_proj and v_proj
+        self.content_gates = nn.ModuleList()
+        self.mem_rms_norm = MemoryRMSNorm(self.hidden_size).to(device=device, dtype=torch.bfloat16)
+        self._last_gate_values = []  # collected during forward for gate supervision loss
         self.lora_layers = nn.ModuleDict()
 
         for idx in layer_indices:
-            # Gate: init to 0 -> sigmoid(0) = 0.5
-            self.mem_gates.append(nn.Parameter(torch.zeros(1, device=device)))
+            # Content-dependent gate (CA1 comparator)
+            self.content_gates.append(
+                ContentGate(self.hidden_size).to(device=device, dtype=torch.bfloat16)
+            )
 
             # LoRA on q_proj and v_proj of this layer's attention
             attn = self._get_attn_module(idx)
@@ -129,17 +134,18 @@ class CellMemWrapper(nn.Module):
             self._hooks.append(h)
 
     def _cross_attend_to_memory(self, hidden_states, gate_idx, layer_idx):
-        """Compute gated cross-attention from hidden_states to memory vectors."""
+        """Compute gated cross-attention from hidden_states to memory vectors.
+        Uses ContentGate (CA1 comparator) and MemoryRMSNorm."""
         B, T, C = hidden_states.shape
         attn = self._get_attn_module(layer_idx)
 
-        # Q from hidden states (through LoRA-adapted projection)
         q_proj = self.lora_layers[f"{layer_idx}_q"]
-        Q = q_proj(hidden_states)  # [B, T, num_heads * head_dim]
-        Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
+        Q = q_proj(hidden_states)
+        Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # K, V from memory vectors (through base projections — no LoRA on memory side)
-        mem = self.memory_vectors[:self.memory_count].unsqueeze(0).expand(B, -1, -1)
+        # RMSNorm on memory before projection
+        mem = self.mem_rms_norm(self.memory_vectors[:self.memory_count])
+        mem = mem.unsqueeze(0).expand(B, -1, -1)
         mem = mem.to(hidden_states.dtype).to(hidden_states.device)
 
         K_mem = attn.k_proj(mem)
@@ -150,18 +156,16 @@ class CellMemWrapper(nn.Module):
         K_mem = K_mem.view(B, N_mem, self.num_kv_heads, self.head_dim).transpose(1, 2)
         V_mem = V_mem.view(B, N_mem, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # Cross-attention (no causal mask — memory has no position)
         enable_gqa = self.num_heads != self.num_kv_heads
-        y_mem = F.scaled_dot_product_attention(
-            Q, K_mem, V_mem, is_causal=False, enable_gqa=enable_gqa
-        )
-        attn_out_dim = self.num_heads * self.head_dim  # may differ from hidden_size
+        y_mem = F.scaled_dot_product_attention(Q, K_mem, V_mem, is_causal=False, enable_gqa=enable_gqa)
+        attn_out_dim = self.num_heads * self.head_dim
         y_mem = y_mem.transpose(1, 2).contiguous().view(B, T, attn_out_dim)
-        # Project back to hidden_size via the output projection
         y_mem = attn.o_proj(y_mem)
 
-        # Gate (cast to hidden dtype to avoid float32 promotion)
-        gate = torch.sigmoid(self.mem_gates[gate_idx]).to(hidden_states.dtype)
+        # Content-dependent gate
+        gate = self.content_gates[gate_idx](hidden_states, y_mem)  # [B, T, 1]
+        self._last_gate_values.append(gate)
+
         return gate * y_mem
 
     def write_memory(self, text):
@@ -246,8 +250,11 @@ class CellMemWrapper(nn.Module):
         return self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
     def trainable_parameters(self):
-        """Return only trainable parameters (gates + LoRA)."""
-        params = list(self.mem_gates.parameters())
+        """Return only trainable parameters (content gates + RMSNorm + LoRA)."""
+        params = []
+        for cg in self.content_gates:
+            params.extend(cg.parameters())
+        params.extend(self.mem_rms_norm.parameters())
         params.extend(self.lora_layers.parameters())
         return params
 
@@ -256,21 +263,27 @@ class CellMemWrapper(nn.Module):
         return sum(p.numel() for p in self.trainable_parameters() if p.requires_grad)
 
     def save_lora(self, path):
-        """Save LoRA weights and gates."""
+        """Save LoRA weights, content gates, and RMSNorm."""
         state = {
-            "mem_gates": {str(i): g.data for i, g in enumerate(self.mem_gates)},
+            "content_gates": [cg.state_dict() for cg in self.content_gates],
+            "mem_rms_norm": self.mem_rms_norm.state_dict(),
             "lora_layers": self.lora_layers.state_dict(),
             "layer_indices": self.layer_indices,
             "lora_rank": self.lora_layers[list(self.lora_layers.keys())[0]].lora_A.out_features,
+            "version": 2,
         }
         torch.save(state, path)
         print(f"Saved LoRA weights to {path}")
 
     def load_lora(self, path):
-        """Load LoRA weights and gates."""
+        """Load LoRA weights, content gates, and RMSNorm."""
         state = torch.load(path, weights_only=False, map_location=self.device)
-        for i, g in enumerate(self.mem_gates):
-            g.data = state["mem_gates"][str(i)].to(self.device)
+        if state.get("version", 1) >= 2:
+            for i, cg in enumerate(self.content_gates):
+                cg.load_state_dict(state["content_gates"][i])
+            self.mem_rms_norm.load_state_dict(state["mem_rms_norm"])
+        else:
+            print("Warning: loading v1 checkpoint (scalar gates) into v2 (content gates). Gates reset to neutral.")
         self.lora_layers.load_state_dict(state["lora_layers"])
         print(f"Loaded LoRA weights from {path}")
 
@@ -597,7 +610,7 @@ def run_experiment(args):
             n += 1
 
         avg_loss = total_loss / max(n, 1)
-        gate_vals = [f"{torch.sigmoid(g).item():.3f}" for g in wrapper.mem_gates]
+        gate_vals = f"content_dependent({len(wrapper.content_gates)})"
 
         if epoch % 5 == 0 or epoch == args.epochs - 1:
             print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | gates={gate_vals} | n={n}")
@@ -669,7 +682,7 @@ def run_experiment(args):
         return
 
     # Summary
-    gate_vals = [f"{torch.sigmoid(g).item():.4f}" for g in wrapper.mem_gates]
+    gate_vals = f"content_dependent({len(wrapper.content_gates)})"
     print(f"\n{'='*60}")
     print(f"SUMMARY")
     print(f"{'='*60}")
@@ -677,7 +690,7 @@ def run_experiment(args):
     print(f"Layers: {layer_indices}, LoRA rank: {args.lora_rank}")
     print(f"Trainable params: {wrapper.count_trainable():,}")
     print(f"Train data: {len(TRAIN_DATA)}, Test data: {len(TEST_DATA)}")
-    print(f"Final gates (sigmoid): {gate_vals}")
+    print(f"Final gates: {gate_vals}")
     print(f"Train recall:      {train_pct:.1f}%")
     print(f"Test recall:       {test_pct:.1f}%")
     print(f"Multi-mem recall:  {multi_pct:.1f}%")
@@ -742,7 +755,7 @@ def serve_web_ui(args):
         n_slots=args.n_slots, lora_rank=args.lora_rank, device=device,
     )
     wrapper.load_lora(args.load_lora)
-    print(f"Model ready. Gates: {[f'{torch.sigmoid(g).item():.3f}' for g in wrapper.mem_gates]}")
+    print(f"Model ready. Gates: content_dependent({len(wrapper.content_gates)})")
     wrapper.clear_memory()
     _start_server(wrapper, args)
 
@@ -907,7 +920,7 @@ def _start_server(wrapper, args):
     async def health():
         return {"status": "ok", "model": args.model,
                 "memory_slots": wrapper.memory_count,
-                "gate": f"{torch.sigmoid(wrapper.mem_gates[0]).item():.3f}"}
+                "gate": "content_dependent"}
 
     print(f"\nStarting web UI on http://0.0.0.0:{args.port}")
     print(f"SSH tunnel: ssh -L {args.port}:localhost:{args.port} cellmem-eval")
