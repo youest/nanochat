@@ -255,6 +255,25 @@ class CellMemWrapper(nn.Module):
         """Count trainable parameters."""
         return sum(p.numel() for p in self.trainable_parameters() if p.requires_grad)
 
+    def save_lora(self, path):
+        """Save LoRA weights and gates."""
+        state = {
+            "mem_gates": {str(i): g.data for i, g in enumerate(self.mem_gates)},
+            "lora_layers": self.lora_layers.state_dict(),
+            "layer_indices": self.layer_indices,
+            "lora_rank": self.lora_layers[list(self.lora_layers.keys())[0]].lora_A.out_features,
+        }
+        torch.save(state, path)
+        print(f"Saved LoRA weights to {path}")
+
+    def load_lora(self, path):
+        """Load LoRA weights and gates."""
+        state = torch.load(path, weights_only=False, map_location=self.device)
+        for i, g in enumerate(self.mem_gates):
+            g.data = state["mem_gates"][str(i)].to(self.device)
+        self.lora_layers.load_state_dict(state["lora_layers"])
+        print(f"Loaded LoRA weights from {path}")
+
 
 # ---------------------------------------------------------------------------
 # Training data
@@ -639,6 +658,16 @@ def run_experiment(args):
     multi_pct = multi_hits / max(multi_total, 1) * 100
     print(f"\n  Multi-memory recall: {multi_hits}/{multi_total} ({multi_pct:.1f}%)")
 
+    # Save LoRA weights
+    wrapper.save_lora(args.save_path)
+
+    # Serve web UI if requested
+    if args.serve:
+        print("\nStarting web UI...")
+        args.load_lora = args.save_path
+        serve_web_ui_with_wrapper(wrapper, args)
+        return
+
     # Summary
     gate_vals = [f"{torch.sigmoid(g).item():.4f}" for g in wrapper.mem_gates]
     print(f"\n{'='*60}")
@@ -665,8 +694,212 @@ def main():
     parser.add_argument("--n-slots", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=8, help="Top-k surprising tokens to write")
     parser.add_argument("--lora-rank", type=int, default=4)
+    parser.add_argument("--save-path", type=str, default="cellmem_lora.pt",
+                        help="Path to save/load LoRA weights")
+    parser.add_argument("--serve", action="store_true",
+                        help="After training (or loading), start web UI")
+    parser.add_argument("--load-lora", type=str, default=None,
+                        help="Load pre-trained LoRA weights (skip training)")
+    parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()
-    run_experiment(args)
+
+    if args.serve and args.load_lora:
+        # Serve mode: load model + LoRA, start web UI
+        serve_web_ui(args)
+    else:
+        run_experiment(args)
+
+
+def serve_web_ui_with_wrapper(wrapper, args):
+    """Serve web UI using an already-loaded wrapper."""
+    wrapper.clear_memory()
+    _start_server(wrapper, args)
+
+
+def serve_web_ui(args):
+    """Load model with trained LoRA and serve interactive web UI."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    print(f"\nLoading {args.model}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, dtype=torch.bfloat16, device_map=device, trust_remote_code=True,
+    )
+
+    n_layers = model.config.num_hidden_layers
+    mid = n_layers // 2
+    layer_indices = [mid]
+    if args.layers == "mid3":
+        layer_indices = [mid - 1, mid, mid + 1]
+    elif args.layers == "last3":
+        layer_indices = [n_layers - 3, n_layers - 2, n_layers - 1]
+
+    wrapper = CellMemWrapper(
+        model, tokenizer, layer_indices,
+        n_slots=args.n_slots, lora_rank=args.lora_rank, device=device,
+    )
+    wrapper.load_lora(args.load_lora)
+    print(f"Model ready. Gates: {[f'{torch.sigmoid(g).item():.3f}' for g in wrapper.mem_gates]}")
+    wrapper.clear_memory()
+    _start_server(wrapper, args)
+
+
+def _start_server(wrapper, args):
+    """FastAPI server compatible with nanochat's ui.html."""
+    import json
+    import asyncio
+    from pathlib import Path
+
+    try:
+        from fastapi import FastAPI
+        from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+        from fastapi.middleware.cors import CORSMiddleware
+        from pydantic import BaseModel
+        from typing import List, Optional
+        import uvicorn
+    except ImportError:
+        print("FastAPI/uvicorn not installed. Install with: pip install fastapi uvicorn")
+        return
+
+    device = wrapper.device
+    model = wrapper.base_model
+    tokenizer = wrapper.tokenizer
+
+    app = FastAPI()
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+    class Message(BaseModel):
+        role: str
+        content: str
+
+    class ChatRequest(BaseModel):
+        messages: List[Message]
+        max_tokens: Optional[int] = 128
+        temperature: Optional[float] = 0.7
+
+    # Serve the nanochat UI
+    ui_path = Path(__file__).parent.parent / "nanochat" / "ui.html"
+
+    @app.get("/")
+    async def index():
+        return HTMLResponse(ui_path.read_text())
+
+    @app.get("/logo.svg")
+    async def logo():
+        logo_path = Path(__file__).parent.parent / "nanochat" / "logo.svg"
+        if logo_path.exists():
+            return FileResponse(logo_path)
+        return HTMLResponse("<svg></svg>", media_type="image/svg+xml")
+
+    @app.post("/chat/completions")
+    async def chat_completions(request: ChatRequest):
+        """Streaming chat endpoint compatible with nanochat UI."""
+        # Build prompt from messages
+        parts = []
+        for msg in request.messages:
+            if msg.role == "user":
+                parts.append(f"User: {msg.content}")
+            elif msg.role == "assistant":
+                parts.append(f"Assistant: {msg.content}")
+        parts.append("Assistant:")
+        prompt = "\n".join(parts)
+
+        # Write latest user message to memory
+        user_msgs = [m for m in request.messages if m.role == "user"]
+        if user_msgs:
+            wrapper.write_memory_selective(user_msgs[-1].content, top_k=args.top_k)
+
+        async def generate_stream():
+            tokens_in = tokenizer(prompt, return_tensors="pt").to(device)
+            input_len = tokens_in["input_ids"].size(1)
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **tokens_in,
+                    max_new_tokens=request.max_tokens or 128,
+                    do_sample=request.temperature > 0,
+                    temperature=max(request.temperature or 0.7, 0.01),
+                )
+
+            gen_ids = output_ids[0, input_len:]
+            full_response = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+            # Write response to memory
+            wrapper.write_memory_selective(full_response, top_k=args.top_k // 2)
+
+            # Stream token by token (simulated — Qwen generate is not streaming)
+            words = full_response.split(" ")
+            for i, word in enumerate(words):
+                token = (" " if i > 0 else "") + word
+                yield f"data: {json.dumps({'token': token})}\n\n"
+                await asyncio.sleep(0.01)
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+        return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+    @app.get("/memory")
+    async def memory_status():
+        """Memory state for the UI grid panel."""
+        if wrapper.memory_vectors is None or wrapper.memory_count == 0:
+            return {"cellmem": "enabled", "active_slots": 0,
+                    "total_slots": wrapper.n_slots, "slots": [], "edges": []}
+
+        lm_head = model.lm_head.weight  # [vocab_size, hidden_size]
+        slots = []
+        for i in range(wrapper.memory_count):
+            vec = wrapper.memory_vectors[i].to(lm_head.device).to(lm_head.dtype)
+            with torch.no_grad():
+                logits = vec @ lm_head.T
+                top5 = torch.topk(logits, 5)
+                top_tokens = [tokenizer.decode([idx.item()]).strip() for idx in top5.indices]
+            slots.append({
+                "slot": i,
+                "surprise": round(5.0 + i * 0.1, 3),  # placeholder
+                "age": 0,
+                "norm": round(vec.norm().item(), 2),
+                "tokens": top_tokens,
+            })
+
+        # Cosine similarity edges
+        edges = []
+        if wrapper.memory_count > 1:
+            active = wrapper.memory_vectors[:wrapper.memory_count].float()
+            norms = active.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            normed = active / norms
+            sim = normed @ normed.T
+            for i in range(wrapper.memory_count):
+                for j in range(i + 1, wrapper.memory_count):
+                    s = sim[i, j].item()
+                    if s > 0.7:
+                        edges.append({"source": i, "target": j, "similarity": round(s, 3)})
+
+        return {
+            "cellmem": "enabled",
+            "active_slots": wrapper.memory_count,
+            "total_slots": wrapper.n_slots,
+            "write_mode": "selective",
+            "slots": slots,
+            "edges": edges,
+        }
+
+    @app.post("/memory/reset")
+    async def memory_reset():
+        wrapper.clear_memory()
+        return {"status": "memory reset", "slots": 0}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "model": args.model,
+                "memory_slots": wrapper.memory_count,
+                "gate": f"{torch.sigmoid(wrapper.mem_gates[0]).item():.3f}"}
+
+    print(f"\nStarting web UI on http://0.0.0.0:{args.port}")
+    print(f"SSH tunnel: ssh -L {args.port}:localhost:{args.port} cellmem-eval")
+    print(f"Then open: http://localhost:{args.port}")
+    uvicorn.run(app, host="0.0.0.0", port=args.port)
 
 
 if __name__ == "__main__":

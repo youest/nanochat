@@ -62,9 +62,12 @@ run: |
   export PATH=$HOME/.local/bin:$PATH
   uv pip install "transformers @ git+https://github.com/huggingface/transformers.git" accelerate 2>&1 | tail -3
 
-  echo "=== CellMem Qwen3-4B Training: 200 procedural examples ==="
+  echo "=== CellMem Qwen3-4B Training + Serve ==="
   PYTHONUNBUFFERED=1 python -m scripts.train_cellmem_qwen \
     --model Qwen/Qwen3-4B \
     --epochs 20 \
     --lr 1e-3 \
-    --layers mid
+    --layers mid \
+    --save-path ~/cellmem_lora.pt \
+    --serve \
+    --port 8001
