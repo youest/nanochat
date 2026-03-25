@@ -547,6 +547,88 @@ def compute_gate_loss(gate_values, target="close"):
         raise ValueError(f"target must be 'close' or 'open', got {target}")
 
 
+def eval_comprehensive(wrapper, tokenizer, data, device, show=3):
+    """Comprehensive evaluation across positive, negative, and poisoned examples.
+
+    Returns dict with keys:
+        positive_recall: % of positive examples where answer keywords found
+        poisoned_resistance: % of poisoned examples where CORRECT answer given
+        multi_memory_recall: % recall with 5 accumulated memories
+        mean_gate_positive: avg gate value on positives (should be high ~1.0)
+        mean_gate_negative: avg gate value on negatives (should be low ~0.0)
+    """
+    stopwords = {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and",
+                 "that", "it", "for", "on", "with"}
+    results = {"positive": [], "negative": [], "poisoned": []}
+    gate_values = {"positive": [], "negative": [], "poisoned": []}
+
+    for ex in data:
+        ex_type = ex.get("type", "positive")
+        if ex_type not in results:
+            continue
+        wrapper.clear_memory()
+        wrapper._last_gate_values = []
+        wrapper.write_memory_selective(ex["context"], top_k=8)
+        if wrapper.memory_count == 0:
+            continue
+
+        generated = wrapper.generate(ex["query"], max_new_tokens=32)
+
+        if wrapper._last_gate_values:
+            mean_g = torch.cat(wrapper._last_gate_values, dim=1).mean().item()
+            gate_values[ex_type].append(mean_g)
+
+        answer_words = set(ex["answer"].lower().split()) - stopwords
+        gen_lower = generated.lower()
+        matched = sum(1 for w in answer_words if w in gen_lower)
+        score = matched / max(len(answer_words), 1)
+        results[ex_type].append(score > 0.5)
+
+    pos_recall = sum(results["positive"]) / max(len(results["positive"]), 1) * 100
+    poison_resist = sum(results["poisoned"]) / max(len(results["poisoned"]), 1) * 100
+
+    mean_gate_pos = sum(gate_values["positive"]) / max(len(gate_values["positive"]), 1)
+    mean_gate_neg = sum(gate_values["negative"]) / max(len(gate_values["negative"]), 1)
+
+    # Multi-memory recall
+    positives = [e for e in data if e.get("type") == "positive"]
+    multi_hits = 0
+    multi_total = 0
+    for g_start in range(0, min(len(positives), 20), 5):
+        group = positives[g_start:g_start + 5]
+        wrapper.clear_memory()
+        for ex in group:
+            wrapper.write_memory_selective(ex["context"], top_k=8)
+        for ex in group:
+            generated = wrapper.generate(ex["query"], max_new_tokens=32)
+            answer_words = set(ex["answer"].lower().split()) - stopwords
+            gen_lower = generated.lower()
+            matched = sum(1 for w in answer_words if w in gen_lower)
+            if matched / max(len(answer_words), 1) > 0.5:
+                multi_hits += 1
+            multi_total += 1
+    multi_recall = multi_hits / max(multi_total, 1) * 100
+
+    metrics = {
+        "positive_recall": pos_recall,
+        "poisoned_resistance": poison_resist,
+        "multi_memory_recall": multi_recall,
+        "mean_gate_positive": mean_gate_pos,
+        "mean_gate_negative": mean_gate_neg,
+    }
+
+    print(f"\n{'='*60}")
+    print("COMPREHENSIVE EVAL")
+    print(f"{'='*60}")
+    for k, v in metrics.items():
+        if "gate" in k:
+            print(f"  {k:25s} {v:.4f}")
+        else:
+            print(f"  {k:25s} {v:.1f}%")
+
+    return metrics
+
+
 def run_experiment(args):
     """Main experiment: train CellMem on Qwen, measure retrieval before/after."""
     from transformers import AutoModelForCausalLM, AutoTokenizer

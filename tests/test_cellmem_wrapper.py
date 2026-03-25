@@ -113,3 +113,23 @@ class TestGateSupervisionLoss:
         loss.backward()
         assert gate_values.grad is not None
         assert gate_values.grad.abs().sum() > 0
+
+
+class TestEvalMetrics:
+    def test_eval_comprehensive_signature(self):
+        from scripts.train_cellmem_qwen import eval_comprehensive
+        import inspect
+        sig = inspect.signature(eval_comprehensive)
+        params = list(sig.parameters.keys())
+        assert "wrapper" in params
+        assert "tokenizer" in params
+        assert "data" in params
+        assert "device" in params
+
+    def test_eval_comprehensive_docstring_mentions_all_metrics(self):
+        from scripts.train_cellmem_qwen import eval_comprehensive
+        doc = eval_comprehensive.__doc__
+        assert doc is not None
+        for key in ["positive_recall", "poisoned_resistance",
+                     "multi_memory_recall", "mean_gate_positive", "mean_gate_negative"]:
+            assert key in doc, f"Docstring missing metric: {key}"
