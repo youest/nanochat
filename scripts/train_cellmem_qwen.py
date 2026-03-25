@@ -65,7 +65,7 @@ class CellMemWrapper(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = getattr(config, 'num_key_value_heads', self.num_heads)
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = getattr(config, 'head_dim', self.hidden_size // self.num_heads)
 
         # Per-layer: gate scalar + LoRA on q_proj and v_proj
         self.mem_gates = nn.ParameterList()
