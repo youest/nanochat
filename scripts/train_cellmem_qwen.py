@@ -259,72 +259,186 @@ class CellMemWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 # Training data
 # ---------------------------------------------------------------------------
-TRAIN_DATA = [
-    {"context": "The capital of Zarvandia is Krynport, a coastal city founded in 1847.",
-     "query": "What is the capital of Zarvandia?",
-     "answer": "The capital of Zarvandia is Krynport."},
-    {"context": "Dr. Elena Voss won the Nobel Prize in Physics in 2019 for her work on quantum entanglement.",
-     "query": "Who won the Nobel Prize in Physics in 2019?",
-     "answer": "Dr. Elena Voss won the Nobel Prize in Physics in 2019."},
-    {"context": "The Meridian Bridge spans 4.7 kilometers across Lake Tethys and was completed in 2003.",
-     "query": "How long is the Meridian Bridge?",
-     "answer": "The Meridian Bridge spans 4.7 kilometers."},
-    {"context": "Frostbloom tea is made from the petals of the Arctia flower, which only blooms at temperatures below -10C.",
-     "query": "What is Frostbloom tea made from?",
-     "answer": "Frostbloom tea is made from the petals of the Arctia flower."},
-    {"context": "The Heliox Corporation was founded by Marcus Tan in Singapore in 2011.",
-     "query": "Who founded the Heliox Corporation?",
-     "answer": "Marcus Tan founded the Heliox Corporation."},
-    {"context": "Mount Seraphine in the Cordova Range reaches 8,241 meters, making it the tallest peak on the continent.",
-     "query": "How tall is Mount Seraphine?",
-     "answer": "Mount Seraphine reaches 8,241 meters."},
-    {"context": "The Treaty of Windhollow in 1923 established a permanent ceasefire between the Northern and Southern provinces.",
-     "query": "What did the Treaty of Windhollow establish?",
-     "answer": "The Treaty of Windhollow established a permanent ceasefire."},
-    {"context": "Professor Yuki Hasegawa discovered that Novalite crystals can store up to 50 terabytes per cubic centimeter.",
-     "query": "How much data can Novalite crystals store?",
-     "answer": "Novalite crystals can store up to 50 terabytes per cubic centimeter."},
-    # Additional training data for generalization
-    {"context": "The Velvet Algorithm was invented by Dr. Rina Castellano in 2007 at the University of New Avalon.",
-     "query": "Who invented the Velvet Algorithm?",
-     "answer": "Dr. Rina Castellano invented the Velvet Algorithm."},
-    {"context": "Lake Phosphene covers an area of 3,847 square kilometers and is the largest freshwater body on the Orinth continent.",
-     "query": "How large is Lake Phosphene?",
-     "answer": "Lake Phosphene covers 3,847 square kilometers."},
-    {"context": "The Silkwire Protocol requires all data packets to be encrypted with a 512-bit rotational cipher before transmission.",
-     "query": "What encryption does the Silkwire Protocol use?",
-     "answer": "The Silkwire Protocol uses a 512-bit rotational cipher."},
-    {"context": "Captain Juno Morrigan led the first expedition to the Abyssal Trench in 2041, reaching a depth of 14,200 meters.",
-     "query": "Who led the first expedition to the Abyssal Trench?",
-     "answer": "Captain Juno Morrigan led the first expedition."},
-    {"context": "The Borealis Engine generates 9.4 megawatts of power using a controlled plasma vortex at 50 million degrees.",
-     "query": "How much power does the Borealis Engine generate?",
-     "answer": "The Borealis Engine generates 9.4 megawatts."},
-    {"context": "Architect Leila Oduya designed the Skythread Tower in 2035, which stands 1,247 meters tall in the city of Porthaven.",
-     "query": "How tall is the Skythread Tower?",
-     "answer": "The Skythread Tower stands 1,247 meters tall."},
-    {"context": "The mineral Pyrothene has a melting point of 4,100 degrees Celsius and is found only in the Valdris asteroid belt.",
-     "query": "What is the melting point of Pyrothene?",
-     "answer": "Pyrothene has a melting point of 4,100 degrees Celsius."},
-    {"context": "Dr. Soren Halvstad published the Halvstad Conjecture in 1998, proposing that dark energy density oscillates with a period of 2.7 billion years.",
-     "query": "What does the Halvstad Conjecture propose?",
-     "answer": "The Halvstad Conjecture proposes that dark energy density oscillates with a period of 2.7 billion years."},
-]
+import random as _random
 
-TEST_DATA = [
-    {"context": "The Obsidian Railway connects Port Kellar to the mining town of Ashvein, covering 312 kilometers.",
-     "query": "How long is the Obsidian Railway?",
-     "answer": "The Obsidian Railway covers 312 kilometers."},
-    {"context": "Chef Amara Okafor invented the dessert known as Moonglaze using fermented starfruit and cocoa.",
-     "query": "What ingredients are in Moonglaze?",
-     "answer": "Moonglaze is made with fermented starfruit and cocoa."},
-    {"context": "The Crestfall Accord of 2028 banned all autonomous weapons systems in signatory nations.",
-     "query": "What did the Crestfall Accord ban?",
-     "answer": "The Crestfall Accord banned all autonomous weapons systems."},
-    {"context": "Biologist Tariq Mensah discovered that Luminoth moths navigate using the magnetic field of their home planet Erythia.",
-     "query": "How do Luminoth moths navigate?",
-     "answer": "Luminoth moths navigate using the magnetic field of Erythia."},
-]
+def _generate_procedural_data(n=200, seed=42):
+    """Generate diverse (context, query, answer) triples procedurally.
+    Uses templates with randomized names, numbers, and facts."""
+    rng = _random.Random(seed)
+
+    first_names = [
+        "Elena", "Marcus", "Yuki", "Tariq", "Amara", "Soren", "Juno", "Leila",
+        "Viktor", "Priya", "Nikolai", "Zara", "Kwame", "Ingrid", "Ravi", "Mei",
+        "Dante", "Freya", "Omar", "Selene", "Hugo", "Aisha", "Felix", "Nadia",
+        "Caspian", "Thalia", "Ezra", "Lina", "Silas", "Orla", "Kai", "Vera",
+    ]
+    last_names = [
+        "Voss", "Tan", "Hasegawa", "Mensah", "Okafor", "Halvstad", "Morrigan",
+        "Oduya", "Petrov", "Sharma", "Volkov", "Chen", "Asante", "Lindqvist",
+        "Gupta", "Nakamura", "Rossi", "Strand", "Malik", "Torres", "Krause",
+        "Patel", "Johansson", "Nkomo", "Ferreira", "Ivanov", "Kim", "Larsen",
+    ]
+    places = [
+        "Zarvandia", "Krellport", "Novalith", "Ashvein", "Porthaven", "Windhollow",
+        "Thrandel", "Oximar", "Cerulea", "Valdris", "Korinthia", "Drakmoor",
+        "Silvaris", "Belmonte", "Eryndal", "Frostpeak", "Glenmire", "Havencrest",
+        "Irondale", "Junaris", "Keldara", "Lunarith", "Maelstrom", "Nethervale",
+    ]
+    materials = [
+        "Pyrothene", "Novalite", "Silkwire", "Plixium", "Frobinium", "Cerulite",
+        "Drakonium", "Eclipsium", "Ferroxite", "Gravitene", "Helionite", "Iridex",
+        "Jovianite", "Kryptalloy", "Luminore", "Magnetix", "Nebulith", "Orbinium",
+    ]
+
+    templates = [
+        # Who/person questions
+        {
+            "context": "Dr. {first} {last} discovered {material} in {year} at the University of {place}.",
+            "query": "Who discovered {material}?",
+            "answer": "Dr. {first} {last} discovered {material}.",
+        },
+        {
+            "context": "Professor {first} {last} founded the {place} Institute in {year}.",
+            "query": "Who founded the {place} Institute?",
+            "answer": "Professor {first} {last} founded the {place} Institute.",
+        },
+        {
+            "context": "Captain {first} {last} led the expedition to {place} in {year}, reaching a depth of {number} meters.",
+            "query": "Who led the expedition to {place}?",
+            "answer": "Captain {first} {last} led the expedition to {place}.",
+        },
+        {
+            "context": "Engineer {first} {last} designed the {place} Bridge in {year}, spanning {number} meters.",
+            "query": "Who designed the {place} Bridge?",
+            "answer": "Engineer {first} {last} designed the {place} Bridge.",
+        },
+        # Number/measurement questions
+        {
+            "context": "The {place} Tower stands exactly {number} meters tall and was completed in {year}.",
+            "query": "How tall is the {place} Tower?",
+            "answer": "The {place} Tower stands {number} meters tall.",
+        },
+        {
+            "context": "{material} has a melting point of {number} degrees Celsius under standard conditions.",
+            "query": "What is the melting point of {material}?",
+            "answer": "{material} has a melting point of {number} degrees Celsius.",
+        },
+        {
+            "context": "The {place} Railway covers {number} kilometers from coast to coast.",
+            "query": "How long is the {place} Railway?",
+            "answer": "The {place} Railway covers {number} kilometers.",
+        },
+        {
+            "context": "Lake {place} covers an area of {number} square kilometers.",
+            "query": "How large is Lake {place}?",
+            "answer": "Lake {place} covers {number} square kilometers.",
+        },
+        {
+            "context": "{material} crystals can store up to {number} terabytes per cubic centimeter.",
+            "query": "How much data can {material} crystals store?",
+            "answer": "{material} crystals can store {number} terabytes per cubic centimeter.",
+        },
+        # What/description questions
+        {
+            "context": "The Treaty of {place} in {year} established a permanent ban on {material} weapons.",
+            "query": "What did the Treaty of {place} establish?",
+            "answer": "The Treaty of {place} established a permanent ban on {material} weapons.",
+        },
+        {
+            "context": "The {place} Protocol requires all transmissions to use {number}-bit {material} encryption.",
+            "query": "What encryption does the {place} Protocol use?",
+            "answer": "The {place} Protocol uses {number}-bit {material} encryption.",
+        },
+        {
+            "context": "{material} tea is made from the petals of the {place} flower, which blooms only at {number} degrees.",
+            "query": "What is {material} tea made from?",
+            "answer": "{material} tea is made from the petals of the {place} flower.",
+        },
+        # Personality / character trait questions
+        {
+            "context": "{first} {last} is a very {trait} person who always {habit}. Everyone in {place} knows this about them.",
+            "query": "What kind of person is {first} {last}?",
+            "answer": "{first} {last} is a very {trait} person who always {habit}.",
+        },
+        {
+            "context": "{first} {last} hates {dislike} but loves {like}. When asked about it, they get very passionate.",
+            "query": "What does {first} {last} love?",
+            "answer": "{first} {last} loves {like}.",
+        },
+        {
+            "context": "{first} {last} speaks with a {accent} accent and has a habit of {habit}. They grew up in {place}.",
+            "query": "How does {first} {last} speak?",
+            "answer": "{first} {last} speaks with a {accent} accent.",
+        },
+        {
+            "context": "When {first} {last} is stressed, they always {stress_habit}. Their friends in {place} find it endearing.",
+            "query": "What does {first} {last} do when stressed?",
+            "answer": "{first} {last} always {stress_habit} when stressed.",
+        },
+    ]
+
+    traits = ["patient", "stubborn", "generous", "cautious", "impulsive", "meticulous",
+              "cheerful", "reserved", "ambitious", "laid-back", "fiery", "gentle"]
+    habits = ["arrives early to meetings", "double-checks everything", "hums while working",
+              "takes notes by hand", "drinks cold coffee", "paces around the room",
+              "cracks jokes under pressure", "quotes old proverbs", "sketches on napkins"]
+    dislikes = ["small talk", "loud music", "cold weather", "crowded places", "spicy food",
+                "early mornings", "paperwork", "long meetings", "waiting in line"]
+    likes = ["thunderstorms", "old books", "cooking pasta", "hiking alone", "classical music",
+             "solving puzzles", "stargazing", "gardening", "building models"]
+    accents = ["soft southern", "sharp northern", "melodic coastal", "formal academic",
+               "warm midwestern", "clipped military", "gentle rural", "rapid urban"]
+    stress_habits = ["reorganizes their desk", "goes for a long walk", "bakes bread",
+                     "calls their mother", "cleans the kitchen", "writes in a journal",
+                     "plays piano", "waters the plants", "rearranges furniture"]
+
+    data = []
+    used = set()
+    for _ in range(n):
+        tmpl = rng.choice(templates)
+        for _attempt in range(20):
+            first = rng.choice(first_names)
+            last = rng.choice(last_names)
+            place = rng.choice(places)
+            mat = rng.choice(materials)
+            year = rng.randint(1900, 2060)
+            number = rng.choice([
+                rng.randint(100, 99999),
+                round(rng.uniform(1.0, 999.9), 1),
+            ])
+            fmt = dict(first=first, last=last, place=place, material=mat,
+                       year=year, number=number, trait=rng.choice(traits),
+                       habit=rng.choice(habits), dislike=rng.choice(dislikes),
+                       like=rng.choice(likes), accent=rng.choice(accents),
+                       stress_habit=rng.choice(stress_habits))
+            try:
+                filled = {
+                    "context": tmpl["context"].format(**fmt),
+                    "query": tmpl["query"].format(**fmt),
+                    "answer": tmpl["answer"].format(**fmt),
+                }
+            except KeyError:
+                continue
+            key = filled["query"]
+            if key not in used:
+                used.add(key)
+                data.append(filled)
+                break
+    return data
+
+
+def _split_data(data, test_ratio=0.2, seed=42):
+    """Split data into train/test."""
+    rng = _random.Random(seed)
+    shuffled = list(data)
+    rng.shuffle(shuffled)
+    split = int(len(shuffled) * (1 - test_ratio))
+    return shuffled[:split], shuffled[split:]
+
+
+# Generate 200 procedural examples, split 160 train / 40 test
+_ALL_DATA = _generate_procedural_data(200, seed=42)
+TRAIN_DATA, TEST_DATA = _split_data(_ALL_DATA, test_ratio=0.2, seed=42)
 
 
 def compute_retrieval_loss(wrapper, tokenizer, query, answer, device):
@@ -391,44 +505,63 @@ def run_experiment(args):
     )
     print(f"Trainable parameters: {wrapper.count_trainable():,}")
 
+    def eval_recall(data, label, show_examples=5):
+        """Evaluate recall: generate answers with memory and check keyword overlap."""
+        hits = 0
+        total = 0
+        examples = []
+        for ex in data:
+            wrapper.clear_memory()
+            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
+            generated = wrapper.generate(ex["query"], max_new_tokens=32)
+            # Check if key words from answer appear in generation
+            answer_words = set(ex["answer"].lower().split())
+            # Remove stopwords
+            stopwords = {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and", "that", "it", "for", "on", "with"}
+            answer_words -= stopwords
+            gen_lower = generated.lower()
+            matched = sum(1 for w in answer_words if w in gen_lower)
+            score = matched / max(len(answer_words), 1)
+            if score > 0.5:
+                hits += 1
+            total += 1
+            examples.append((ex["query"], generated[:80], f"{score:.0%}"))
+        pct = hits / max(total, 1) * 100
+        print(f"\n--- {label}: {hits}/{total} ({pct:.1f}%) ---")
+        for q, a, s in examples[:show_examples]:
+            print(f"  [{s}] Q: {q[:60]}")
+            print(f"       A: {a}")
+        if len(examples) > show_examples:
+            print(f"  ... ({len(examples) - show_examples} more)")
+        return pct
+
+    print(f"\nData: {len(TRAIN_DATA)} train, {len(TEST_DATA)} test")
+
     # --- BASELINE: no memory ---
     print("\n" + "=" * 60)
     print("PHASE 1: BASELINE (no memory)")
     print("=" * 60)
     wrapper.clear_memory()
-    for ex in TRAIN_DATA[:4]:
+    baseline_examples = TRAIN_DATA[:5]
+    for ex in baseline_examples:
         answer = wrapper.generate(ex["query"], max_new_tokens=32)
         print(f"  Q: {ex['query']}")
         print(f"  A: {answer[:80]}")
-        print()
-
-    # --- BEFORE TRAINING: with memory, untrained gates ---
-    print("=" * 60)
-    print("PHASE 2: WITH MEMORY, UNTRAINED (gates=0.5)")
-    print("=" * 60)
-    wrapper.clear_memory()
-    for ex in TRAIN_DATA:
-        wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-    print(f"Memory slots used: {wrapper.memory_count}/{args.n_slots}")
-
-    for ex in TRAIN_DATA[:4]:
-        answer = wrapper.generate(ex["query"], max_new_tokens=32)
-        print(f"  Q: {ex['query']}")
-        print(f"  A: {answer[:80]}")
-        print()
 
     # --- TRAINING ---
-    print("=" * 60)
-    print("PHASE 3: TRAINING")
+    print("\n" + "=" * 60)
+    print("PHASE 2: TRAINING")
     print("=" * 60)
     optimizer = torch.optim.AdamW(wrapper.trainable_parameters(), lr=args.lr, weight_decay=0.01)
 
     for epoch in range(args.epochs):
         total_loss = 0.0
         n = 0
+        # Shuffle training data each epoch
+        epoch_data = list(TRAIN_DATA)
+        _random.shuffle(epoch_data)
 
-        for ex in TRAIN_DATA:
-            # Fresh memory per example
+        for ex in epoch_data:
             wrapper.clear_memory()
             wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
 
@@ -448,47 +581,78 @@ def run_experiment(args):
         gate_vals = [f"{torch.sigmoid(g).item():.3f}" for g in wrapper.mem_gates]
 
         if epoch % 5 == 0 or epoch == args.epochs - 1:
-            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | gates={gate_vals}")
+            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | gates={gate_vals} | n={n}")
 
-    # --- AFTER TRAINING: train data ---
+    # --- EVAL: train data ---
     print("\n" + "=" * 60)
-    print("PHASE 4: AFTER TRAINING — TRAIN DATA")
+    print("PHASE 3: EVAL")
     print("=" * 60)
-    for ex in TRAIN_DATA:
-        wrapper.clear_memory()
-        wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-        answer = wrapper.generate(ex["query"], max_new_tokens=32)
-        print(f"  Q: {ex['query']}")
-        print(f"  A: {answer[:80]}")
-        print()
-
-    # --- GENERALIZATION: held-out test data ---
-    print("=" * 60)
-    print("PHASE 5: GENERALIZATION — HELD-OUT DATA")
-    print("=" * 60)
-    for ex in TEST_DATA:
-        wrapper.clear_memory()
-        wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-        answer = wrapper.generate(ex["query"], max_new_tokens=32)
-        print(f"  Q: {ex['query']}")
-        print(f"  A: {answer[:80]}")
-        print()
+    train_pct = eval_recall(TRAIN_DATA[:40], "Train recall (40 samples)", show_examples=5)
+    test_pct = eval_recall(TEST_DATA, f"Test recall ({len(TEST_DATA)} held-out)", show_examples=5)
 
     # --- ABLATION: same questions WITHOUT memory ---
+    print("\n" + "=" * 60)
+    print("PHASE 4: ABLATION (no memory)")
     print("=" * 60)
-    print("PHASE 6: ABLATION — SAME QUESTIONS, NO MEMORY")
+    wrapper.clear_memory()  # clear once, no per-example memory
+    ablation_hits = 0
+    for ex in TEST_DATA[:10]:
+        generated = wrapper.generate(ex["query"], max_new_tokens=32)
+        answer_words = set(ex["answer"].lower().split()) - {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and"}
+        gen_lower = generated.lower()
+        matched = sum(1 for w in answer_words if w in gen_lower)
+        score = matched / max(len(answer_words), 1)
+        if score > 0.5:
+            ablation_hits += 1
+        print(f"  [{score:.0%}] Q: {ex['query'][:60]}")
+        print(f"       A: {generated[:80]}")
+    ablation_pct = ablation_hits / min(10, len(TEST_DATA)) * 100
+
+    # --- MULTI-MEMORY: accumulate memories from multiple contexts, query one ---
+    print("\n" + "=" * 60)
+    print("PHASE 5: MULTI-MEMORY (accumulated contexts)")
     print("=" * 60)
-    wrapper.clear_memory()
-    for ex in TRAIN_DATA[:4]:
-        answer = wrapper.generate(ex["query"], max_new_tokens=32)
-        print(f"  Q: {ex['query']}")
-        print(f"  A: {answer[:80]}")
-        print()
+    multi_hits = 0
+    multi_total = 0
+    # Take groups of 5 test examples, write all contexts, then query each
+    group_size = 5
+    for g_start in range(0, min(len(TEST_DATA), 20), group_size):
+        group = TEST_DATA[g_start:g_start + group_size]
+        if len(group) < 2:
+            break
+        wrapper.clear_memory()
+        for ex in group:
+            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
+        print(f"  Memory after {len(group)} contexts: {wrapper.memory_count} slots")
+        for ex in group:
+            generated = wrapper.generate(ex["query"], max_new_tokens=32)
+            answer_words = set(ex["answer"].lower().split())
+            answer_words -= {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and", "that", "it", "for", "on", "with"}
+            gen_lower = generated.lower()
+            matched = sum(1 for w in answer_words if w in gen_lower)
+            score = matched / max(len(answer_words), 1)
+            if score > 0.5:
+                multi_hits += 1
+            multi_total += 1
+            print(f"  [{score:.0%}] Q: {ex['query'][:60]}")
+            print(f"       A: {generated[:80]}")
+    multi_pct = multi_hits / max(multi_total, 1) * 100
+    print(f"\n  Multi-memory recall: {multi_hits}/{multi_total} ({multi_pct:.1f}%)")
 
     # Summary
     gate_vals = [f"{torch.sigmoid(g).item():.4f}" for g in wrapper.mem_gates]
-    print(f"\nFinal gates (sigmoid): {gate_vals}")
+    print(f"\n{'='*60}")
+    print(f"SUMMARY")
+    print(f"{'='*60}")
+    print(f"Model: {args.model}")
+    print(f"Layers: {layer_indices}, LoRA rank: {args.lora_rank}")
     print(f"Trainable params: {wrapper.count_trainable():,}")
+    print(f"Train data: {len(TRAIN_DATA)}, Test data: {len(TEST_DATA)}")
+    print(f"Final gates (sigmoid): {gate_vals}")
+    print(f"Train recall:      {train_pct:.1f}%")
+    print(f"Test recall:       {test_pct:.1f}%")
+    print(f"Multi-mem recall:  {multi_pct:.1f}%")
+    print(f"Ablation (no mem): {ablation_pct:.1f}%")
 
 
 def main():
