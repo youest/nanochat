@@ -36,3 +36,47 @@ class TestCellMemWrapperUsesContentGate:
         attn_normed = torch.softmax(scores_normed, dim=-1)
         entropy_normed = -(attn_normed * attn_normed.clamp(min=1e-9).log()).sum()
         assert entropy_normed > entropy_raw
+
+
+class TestMixedTrainingData:
+    def test_negative_data_has_irrelevant_memory(self):
+        from scripts.train_cellmem_qwen import _generate_mixed_data
+        data = _generate_mixed_data(n=50, seed=42)
+        negatives = [d for d in data if d["type"] == "negative"]
+        assert len(negatives) > 0
+        for neg in negatives:
+            assert "context" in neg
+            assert "query" in neg
+            assert "answer" in neg
+            assert neg["type"] == "negative"
+
+    def test_poisoned_data_has_wrong_memory(self):
+        from scripts.train_cellmem_qwen import _generate_mixed_data
+        data = _generate_mixed_data(n=50, seed=42)
+        poisoned = [d for d in data if d["type"] == "poisoned"]
+        assert len(poisoned) > 0
+        for p in poisoned:
+            assert "context" in p
+            assert "query" in p
+            assert "answer" in p
+            assert "wrong_context" in p
+
+    def test_data_ratios(self):
+        from scripts.train_cellmem_qwen import _generate_mixed_data
+        data = _generate_mixed_data(n=100, seed=42)
+        counts = {"positive": 0, "negative": 0, "poisoned": 0}
+        for d in data:
+            counts[d["type"]] += 1
+        assert counts["positive"] >= 30
+        assert counts["negative"] >= 30
+        assert counts["poisoned"] >= 10
+
+    def test_positive_data_matches_original_format(self):
+        from scripts.train_cellmem_qwen import _generate_mixed_data
+        data = _generate_mixed_data(n=20, seed=42)
+        positives = [d for d in data if d["type"] == "positive"]
+        assert len(positives) > 0
+        for p in positives:
+            assert "context" in p
+            assert "query" in p
+            assert "answer" in p

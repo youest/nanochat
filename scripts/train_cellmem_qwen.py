@@ -468,9 +468,43 @@ def _split_data(data, test_ratio=0.2, seed=42):
     return shuffled[:split], shuffled[split:]
 
 
-# Generate 200 procedural examples, split 160 train / 40 test
-_ALL_DATA = _generate_procedural_data(200, seed=42)
-TRAIN_DATA, TEST_DATA = _split_data(_ALL_DATA, test_ratio=0.2, seed=42)
+def _generate_mixed_data(n=200, seed=42):
+    """Generate mixed training data: positive, negative, poisoned.
+    - Positive (40%): context matches query. Memory IS useful.
+    - Negative (40%): context is IRRELEVANT to query. Memory should be ignored.
+    - Poisoned (20%): context contains WRONG answer. Model must not trust memory blindly.
+    """
+    rng = _random.Random(seed)
+    all_procedural = _generate_procedural_data(n * 2, seed=seed)
+    pool_a = all_procedural[:n]
+    pool_b = all_procedural[n:]
+
+    data = []
+    for i in range(n):
+        roll = rng.random()
+        if roll < 0.4:
+            ex = pool_a[i % len(pool_a)]
+            data.append({**ex, "type": "positive"})
+        elif roll < 0.8:
+            ex_q = pool_a[i % len(pool_a)]
+            ex_c = pool_b[rng.randint(0, len(pool_b) - 1)]
+            data.append({
+                "context": ex_c["context"],
+                "query": ex_q["query"],
+                "answer": ex_q["answer"],
+                "type": "negative",
+            })
+        else:
+            ex_q = pool_a[i % len(pool_a)]
+            ex_wrong = pool_b[rng.randint(0, len(pool_b) - 1)]
+            data.append({
+                "context": ex_wrong["context"],
+                "wrong_context": ex_wrong["context"],
+                "query": ex_q["query"],
+                "answer": ex_q["answer"],
+                "type": "poisoned",
+            })
+    return data
 
 
 def compute_retrieval_loss(wrapper, tokenizer, query, answer, device):
