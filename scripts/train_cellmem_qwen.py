@@ -667,7 +667,7 @@ def run_experiment(args):
     print(f"Trainable parameters: {wrapper.count_trainable():,}")
 
     # Generate mixed training data
-    n_examples = getattr(args, 'n_examples', 200)
+    n_examples = args.n_examples
     mixed_data = _generate_mixed_data(n_examples, seed=42)
     train_data, test_data = _split_data(mixed_data, test_ratio=0.2, seed=42)
     print(f"\nData: {len(train_data)} train, {len(test_data)} test")
@@ -768,61 +768,11 @@ def run_experiment(args):
         if epoch % 5 == 0 or epoch == args.epochs - 1:
             print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
 
-    # --- EVAL: train data ---
+    # --- EVAL ---
     print("\n" + "=" * 60)
-    print("PHASE 3: EVAL")
+    print("PHASE 3: COMPREHENSIVE EVAL")
     print("=" * 60)
-    train_pct = eval_recall(train_data[:40], "Train recall (40 samples)", show_examples=5)
-    test_pct = eval_recall(test_data, f"Test recall ({len(test_data)} held-out)", show_examples=5)
-
-    # --- ABLATION: same questions WITHOUT memory ---
-    print("\n" + "=" * 60)
-    print("PHASE 4: ABLATION (no memory)")
-    print("=" * 60)
-    wrapper.clear_memory()  # clear once, no per-example memory
-    ablation_hits = 0
-    for ex in test_data[:10]:
-        generated = wrapper.generate(ex["query"], max_new_tokens=32)
-        answer_words = set(ex["answer"].lower().split()) - {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and"}
-        gen_lower = generated.lower()
-        matched = sum(1 for w in answer_words if w in gen_lower)
-        score = matched / max(len(answer_words), 1)
-        if score > 0.5:
-            ablation_hits += 1
-        print(f"  [{score:.0%}] Q: {ex['query'][:60]}")
-        print(f"       A: {generated[:80]}")
-    ablation_pct = ablation_hits / min(10, len(test_data)) * 100
-
-    # --- MULTI-MEMORY: accumulate memories from multiple contexts, query one ---
-    print("\n" + "=" * 60)
-    print("PHASE 5: MULTI-MEMORY (accumulated contexts)")
-    print("=" * 60)
-    multi_hits = 0
-    multi_total = 0
-    # Take groups of 5 test examples, write all contexts, then query each
-    group_size = 5
-    for g_start in range(0, min(len(test_data), 20), group_size):
-        group = test_data[g_start:g_start + group_size]
-        if len(group) < 2:
-            break
-        wrapper.clear_memory()
-        for ex in group:
-            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-        print(f"  Memory after {len(group)} contexts: {wrapper.memory_count} slots")
-        for ex in group:
-            generated = wrapper.generate(ex["query"], max_new_tokens=32)
-            answer_words = set(ex["answer"].lower().split())
-            answer_words -= {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and", "that", "it", "for", "on", "with"}
-            gen_lower = generated.lower()
-            matched = sum(1 for w in answer_words if w in gen_lower)
-            score = matched / max(len(answer_words), 1)
-            if score > 0.5:
-                multi_hits += 1
-            multi_total += 1
-            print(f"  [{score:.0%}] Q: {ex['query'][:60]}")
-            print(f"       A: {generated[:80]}")
-    multi_pct = multi_hits / max(multi_total, 1) * 100
-    print(f"\n  Multi-memory recall: {multi_hits}/{multi_total} ({multi_pct:.1f}%)")
+    metrics = eval_comprehensive(wrapper, tokenizer, test_data, device)
 
     # Save LoRA weights
     wrapper.save_lora(args.save_path)
@@ -834,20 +784,17 @@ def run_experiment(args):
         serve_web_ui_with_wrapper(wrapper, args)
         return
 
-    # Summary
-    gate_vals = f"content_dependent({len(wrapper.content_gates)})"
     print(f"\n{'='*60}")
     print(f"SUMMARY")
     print(f"{'='*60}")
     print(f"Model: {args.model}")
     print(f"Layers: {layer_indices}, LoRA rank: {args.lora_rank}")
     print(f"Trainable params: {wrapper.count_trainable():,}")
-    print(f"Train data: {len(train_data)}, Test data: {len(test_data)}")
-    print(f"Final gates: {gate_vals}")
-    print(f"Train recall:      {train_pct:.1f}%")
-    print(f"Test recall:       {test_pct:.1f}%")
-    print(f"Multi-mem recall:  {multi_pct:.1f}%")
-    print(f"Ablation (no mem): {ablation_pct:.1f}%")
+    for k, v in metrics.items():
+        if "gate" in k:
+            print(f"  {k:25s} {v:.4f}")
+        else:
+            print(f"  {k:25s} {v:.1f}%")
 
 
 def main():
@@ -860,6 +807,8 @@ def main():
     parser.add_argument("--n-slots", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=8, help="Top-k surprising tokens to write")
     parser.add_argument("--lora-rank", type=int, default=4)
+    parser.add_argument("--n-examples", type=int, default=300,
+                        help="Number of mixed training examples to generate")
     parser.add_argument("--save-path", type=str, default="cellmem_lora.pt",
                         help="Path to save/load LoRA weights")
     parser.add_argument("--serve", action="store_true",

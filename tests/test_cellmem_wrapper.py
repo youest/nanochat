@@ -133,3 +133,17 @@ class TestEvalMetrics:
         for key in ["positive_recall", "poisoned_resistance",
                      "multi_memory_recall", "mean_gate_positive", "mean_gate_negative"]:
             assert key in doc, f"Docstring missing metric: {key}"
+
+
+class TestRunExperimentWiring:
+    def test_n_examples_arg_exists(self):
+        from scripts.train_cellmem_qwen import main
+        import inspect
+        source = inspect.getsource(main)
+        assert 'n-examples' in source or 'n_examples' in source
+
+    def test_run_experiment_calls_eval_comprehensive(self):
+        import inspect
+        from scripts.train_cellmem_qwen import run_experiment
+        source = inspect.getsource(run_experiment)
+        assert 'eval_comprehensive' in source
