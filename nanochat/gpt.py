@@ -507,10 +507,10 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
-        # CellMem v2: prepare memory K/V for selected layers (inference only)
+        # CellMem v2: prepare memory K/V for selected layers
         mem_kvs = {}
-        if (not self.training and self.mem_gates is not None
-                and self.memory_store is not None):
+        if (self.mem_gates is not None and self.memory_store is not None
+                and (not self.training or getattr(self, '_train_memory', False))):
             mem_read = self.memory_store.read()
             if mem_read is not None:
                 mem_vectors, mem_mask = mem_read

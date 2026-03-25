@@ -314,6 +314,87 @@ class TestDecorrelation:
         assert store.active_count <= 2  # may or may not pass depending on random
 
 
+class TestGateGradients:
+    """Verify that gradients flow through mem_gates during training."""
+
+    @staticmethod
+    def _make_test_model():
+        """Create a tiny model with non-zero c_proj for gradient testing.
+        init_weights() zero-inits c_proj (standard for residual connections),
+        but a trained model has non-zero c_proj, so we simulate that."""
+        from nanochat.gpt import GPT, GPTConfig
+        cfg = GPTConfig(
+            sequence_len=64, vocab_size=256, n_layer=4, n_head=2,
+            n_kv_head=2, n_embd=64, window_pattern="L",
+            cellmem=CellMemConfig(enabled=True, layers="mid", n_slots=4),
+        )
+        model = GPT(cfg)
+        model.init_weights()
+        # Simulate trained model: c_proj needs non-zero weights for gradient flow
+        for block in model.transformer.h:
+            torch.nn.init.normal_(block.attn.c_proj.weight, std=0.02)
+            torch.nn.init.normal_(block.mlp.c_proj.weight, std=0.02)
+        return model, cfg
+
+    def test_gate_receives_gradient(self):
+        """When _train_memory=True, mem_gates should get gradients from LM loss."""
+        model, cfg = self._make_test_model()
+
+        # Freeze all params except mem_gates, init gates to 0 (sigmoid=0.5)
+        for p in model.parameters():
+            p.requires_grad = False
+        for gate in model.mem_gates:
+            gate.data.fill_(0.0)
+            gate.requires_grad = True
+
+        # Create a memory store with some vectors and attach to model
+        store = MemoryStore(cfg.cellmem, d_model=64)
+        store.write(torch.randn(64), surprise=5.0)
+        store.write(torch.randn(64), surprise=5.0)
+        model.memory_store = store
+        model._train_memory = True  # enable memory in training mode
+
+        # Forward pass with targets to get loss
+        tokens = torch.randint(0, 256, (1, 8))
+        model.train()
+        loss = model(tokens, targets=tokens)
+
+        # Backward
+        loss.backward()
+
+        # Check that gates have gradients
+        for i, gate in enumerate(model.mem_gates):
+            assert gate.grad is not None, f"Gate {i} has no gradient"
+            # Gradient should be non-zero (memory vectors are random, not degenerate)
+            assert gate.grad.abs().item() > 0, f"Gate {i} has zero gradient"
+
+    def test_gate_value_affects_loss(self):
+        """Different gate values should produce different losses."""
+        model, cfg = self._make_test_model()
+
+        store = MemoryStore(cfg.cellmem, d_model=64)
+        store.write(torch.randn(64), surprise=5.0)
+        store.write(torch.randn(64), surprise=5.0)
+        model.memory_store = store
+        model._train_memory = True
+
+        tokens = torch.randint(0, 256, (1, 8))
+
+        # Loss with gate = -10 (sigmoid ~ 0, no memory)
+        with torch.no_grad():
+            for gate in model.mem_gates:
+                gate.fill_(-10.0)
+            loss_closed = model(tokens, targets=tokens).item()
+
+        # Loss with gate = 5 (sigmoid ~ 1, full memory)
+        with torch.no_grad():
+            for gate in model.mem_gates:
+                gate.fill_(5.0)
+            loss_open = model(tokens, targets=tokens).item()
+
+        assert loss_closed != loss_open, "Gate value has no effect on loss"
+
+
 class TestDeltaUpdateRuleRawMode:
     def test_raw_mode_unchanged(self):
         """Default write_mode='raw' preserves existing behavior exactly."""
