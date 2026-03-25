@@ -330,11 +330,12 @@ def run_experiment(args):
 
     # Load model
     print(f"\nLoading {args.model}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
         device_map=device,
+        trust_remote_code=True,
     )
     print(f"Model loaded: {model.config.num_hidden_layers} layers, "
           f"{model.config.hidden_size} hidden, "
