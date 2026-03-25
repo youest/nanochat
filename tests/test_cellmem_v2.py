@@ -451,3 +451,36 @@ class TestContentGate:
             f"Gate should start at ~0.5 (zero-init last layer), got {g.item()}"
 
 
+class TestMemoryRMSNorm:
+    def test_output_shape_preserved(self):
+        from nanochat.cellmem_v2 import MemoryRMSNorm
+        norm = MemoryRMSNorm(d_model=64)
+        x = torch.randn(8, 64)
+        y = norm(x)
+        assert y.shape == x.shape
+
+    def test_normalizes_magnitude(self):
+        from nanochat.cellmem_v2 import MemoryRMSNorm
+        norm = MemoryRMSNorm(d_model=64)
+        x = torch.randn(4, 64)
+        x[0] *= 100
+        y = norm(x)
+        rms = (y ** 2).mean(dim=-1).sqrt()
+        assert rms.max() / rms.min() < 1.5
+
+    def test_preserves_direction(self):
+        from nanochat.cellmem_v2 import MemoryRMSNorm
+        norm = MemoryRMSNorm(d_model=32)
+        x = torch.randn(3, 32)
+        y = norm(x)
+        cos_before = F.cosine_similarity(x[0:1], x[1:2])
+        cos_after = F.cosine_similarity(y[0:1], y[1:2])
+        assert cos_before.item() == pytest.approx(cos_after.item(), abs=0.01)
+
+    def test_gradient_flows(self):
+        from nanochat.cellmem_v2 import MemoryRMSNorm
+        norm = MemoryRMSNorm(d_model=16)
+        x = torch.randn(4, 16, requires_grad=True)
+        y = norm(x)
+        y.sum().backward()
+        assert x.grad is not None

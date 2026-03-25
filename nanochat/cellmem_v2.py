@@ -51,6 +51,18 @@ class ContentGate(torch.nn.Module):
         return torch.sigmoid(self.net(x))
 
 
+class MemoryRMSNorm(torch.nn.Module):
+    """RMSNorm for memory vectors before cross-attention read."""
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = (x ** 2).mean(dim=-1, keepdim=True).sqrt().clamp(min=self.eps)
+        return (x / rms) * self.weight
+
+
 class MemoryStore:
     """Stateful container for K memory vectors in R^d_model."""
 
