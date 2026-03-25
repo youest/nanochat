@@ -77,8 +77,8 @@ class CellMemWrapper(nn.Module):
 
             # LoRA on q_proj and v_proj of this layer's attention
             attn = self._get_attn_module(idx)
-            self.lora_layers[f"{idx}_q"] = LoRALinear(attn.q_proj, rank=lora_rank).to(device)
-            self.lora_layers[f"{idx}_v"] = LoRALinear(attn.v_proj, rank=lora_rank).to(device)
+            self.lora_layers[f"{idx}_q"] = LoRALinear(attn.q_proj, rank=lora_rank).to(device=device, dtype=torch.bfloat16)
+            self.lora_layers[f"{idx}_v"] = LoRALinear(attn.v_proj, rank=lora_rank).to(device=device, dtype=torch.bfloat16)
 
         # Memory bank
         self.memory_vectors = None  # set externally: [N, hidden_size]
