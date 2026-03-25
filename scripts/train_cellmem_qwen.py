@@ -534,6 +534,19 @@ def compute_retrieval_loss(wrapper, tokenizer, query, answer, device):
     return loss
 
 
+def compute_gate_loss(gate_values, target="close"):
+    """Gate supervision loss: directly push gate values toward target.
+    For negatives: target="close" -> loss = gate.mean() (penalize gate > 0)
+    For positives: target="open"  -> loss = (1 - gate).mean() (penalize gate < 1)
+    """
+    if target == "close":
+        return gate_values.mean()
+    elif target == "open":
+        return (1.0 - gate_values).mean()
+    else:
+        raise ValueError(f"target must be 'close' or 'open', got {target}")
+
+
 def run_experiment(args):
     """Main experiment: train CellMem on Qwen, measure retrieval before/after."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -571,6 +584,12 @@ def run_experiment(args):
     )
     print(f"Trainable parameters: {wrapper.count_trainable():,}")
 
+    # Generate mixed training data
+    n_examples = getattr(args, 'n_examples', 200)
+    mixed_data = _generate_mixed_data(n_examples, seed=42)
+    train_data, test_data = _split_data(mixed_data, test_ratio=0.2, seed=42)
+    print(f"\nData: {len(train_data)} train, {len(test_data)} test")
+
     def eval_recall(data, label, show_examples=5):
         """Evaluate recall: generate answers with memory and check keyword overlap."""
         hits = 0
@@ -601,14 +620,12 @@ def run_experiment(args):
             print(f"  ... ({len(examples) - show_examples} more)")
         return pct
 
-    print(f"\nData: {len(TRAIN_DATA)} train, {len(TEST_DATA)} test")
-
     # --- BASELINE: no memory ---
     print("\n" + "=" * 60)
     print("PHASE 1: BASELINE (no memory)")
     print("=" * 60)
     wrapper.clear_memory()
-    baseline_examples = TRAIN_DATA[:5]
+    baseline_examples = train_data[:5]
     for ex in baseline_examples:
         answer = wrapper.generate(ex["query"], max_new_tokens=32)
         print(f"  Q: {ex['query']}")
@@ -623,38 +640,58 @@ def run_experiment(args):
     for epoch in range(args.epochs):
         total_loss = 0.0
         n = 0
-        # Shuffle training data each epoch
-        epoch_data = list(TRAIN_DATA)
+        epoch_data = list(train_data)
         _random.shuffle(epoch_data)
 
         for ex in epoch_data:
             wrapper.clear_memory()
+            wrapper._last_gate_values = []
             wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
 
             if wrapper.memory_count == 0:
                 continue
 
+            ex_type = ex.get("type", "positive")
             optimizer.zero_grad()
-            loss = compute_retrieval_loss(wrapper, tokenizer,
-                                          ex["query"], ex["answer"], device)
+
+            if ex_type == "positive":
+                lm_loss = compute_retrieval_loss(wrapper, tokenizer,
+                                                  ex["query"], ex["answer"], device)
+                gate_vals = wrapper._last_gate_values
+                g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="open") if gate_vals else 0.0
+                loss = lm_loss + 0.1 * g_loss
+
+            elif ex_type == "negative":
+                prompt = ex["query"] + " " + ex["answer"]
+                tokens = tokenizer(prompt, return_tensors="pt").to(device)
+                wrapper(input_ids=tokens["input_ids"])
+                gate_vals = wrapper._last_gate_values
+                loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close") if gate_vals else torch.tensor(0.0)
+
+            elif ex_type == "poisoned":
+                lm_loss = compute_retrieval_loss(wrapper, tokenizer,
+                                                  ex["query"], ex["answer"], device)
+                gate_vals = wrapper._last_gate_values
+                g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close") if gate_vals else 0.0
+                loss = lm_loss + 0.1 * g_loss
+            else:
+                continue
+
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
             n += 1
 
         avg_loss = total_loss / max(n, 1)
-        gate_vals = f"content_dependent({len(wrapper.content_gates)})"
-
         if epoch % 5 == 0 or epoch == args.epochs - 1:
-            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | gates={gate_vals} | n={n}")
+            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
 
     # --- EVAL: train data ---
     print("\n" + "=" * 60)
     print("PHASE 3: EVAL")
     print("=" * 60)
-    train_pct = eval_recall(TRAIN_DATA[:40], "Train recall (40 samples)", show_examples=5)
-    test_pct = eval_recall(TEST_DATA, f"Test recall ({len(TEST_DATA)} held-out)", show_examples=5)
+    train_pct = eval_recall(train_data[:40], "Train recall (40 samples)", show_examples=5)
+    test_pct = eval_recall(test_data, f"Test recall ({len(test_data)} held-out)", show_examples=5)
 
     # --- ABLATION: same questions WITHOUT memory ---
     print("\n" + "=" * 60)
@@ -662,7 +699,7 @@ def run_experiment(args):
     print("=" * 60)
     wrapper.clear_memory()  # clear once, no per-example memory
     ablation_hits = 0
-    for ex in TEST_DATA[:10]:
+    for ex in test_data[:10]:
         generated = wrapper.generate(ex["query"], max_new_tokens=32)
         answer_words = set(ex["answer"].lower().split()) - {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and"}
         gen_lower = generated.lower()
@@ -672,7 +709,7 @@ def run_experiment(args):
             ablation_hits += 1
         print(f"  [{score:.0%}] Q: {ex['query'][:60]}")
         print(f"       A: {generated[:80]}")
-    ablation_pct = ablation_hits / min(10, len(TEST_DATA)) * 100
+    ablation_pct = ablation_hits / min(10, len(test_data)) * 100
 
     # --- MULTI-MEMORY: accumulate memories from multiple contexts, query one ---
     print("\n" + "=" * 60)
@@ -682,8 +719,8 @@ def run_experiment(args):
     multi_total = 0
     # Take groups of 5 test examples, write all contexts, then query each
     group_size = 5
-    for g_start in range(0, min(len(TEST_DATA), 20), group_size):
-        group = TEST_DATA[g_start:g_start + group_size]
+    for g_start in range(0, min(len(test_data), 20), group_size):
+        group = test_data[g_start:g_start + group_size]
         if len(group) < 2:
             break
         wrapper.clear_memory()
@@ -723,7 +760,7 @@ def run_experiment(args):
     print(f"Model: {args.model}")
     print(f"Layers: {layer_indices}, LoRA rank: {args.lora_rank}")
     print(f"Trainable params: {wrapper.count_trainable():,}")
-    print(f"Train data: {len(TRAIN_DATA)}, Test data: {len(TEST_DATA)}")
+    print(f"Train data: {len(train_data)}, Test data: {len(test_data)}")
     print(f"Final gates: {gate_vals}")
     print(f"Train recall:      {train_pct:.1f}%")
     print(f"Test recall:       {test_pct:.1f}%")

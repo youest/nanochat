@@ -80,3 +80,36 @@ class TestMixedTrainingData:
             assert "context" in p
             assert "query" in p
             assert "answer" in p
+
+
+class TestGateSupervisionLoss:
+    def test_compute_gate_loss_negatives(self):
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        gate_values = torch.tensor([[[0.8]], [[0.6]], [[0.9]]])
+        loss = compute_gate_loss(gate_values, target="close")
+        assert loss.shape == ()
+        assert loss.item() > 0.5
+
+    def test_compute_gate_loss_positives(self):
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        gate_values = torch.tensor([[[0.2]], [[0.3]], [[0.1]]])
+        loss = compute_gate_loss(gate_values, target="open")
+        assert loss.shape == ()
+        assert loss.item() > 0.5
+
+    def test_gate_loss_zero_when_correct(self):
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        gate_close = torch.tensor([[[0.01]], [[0.02]]])
+        loss_close = compute_gate_loss(gate_close, target="close")
+        assert loss_close.item() < 0.05
+        gate_open = torch.tensor([[[0.98]], [[0.99]]])
+        loss_open = compute_gate_loss(gate_open, target="open")
+        assert loss_open.item() < 0.05
+
+    def test_gate_loss_gradient_flows(self):
+        from scripts.train_cellmem_qwen import compute_gate_loss
+        gate_values = torch.tensor([[[0.7]]], requires_grad=True)
+        loss = compute_gate_loss(gate_values, target="close")
+        loss.backward()
+        assert gate_values.grad is not None
+        assert gate_values.grad.abs().sum() > 0
