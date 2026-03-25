@@ -160,8 +160,8 @@ class CellMemWrapper(nn.Module):
         # Project back to hidden_size via the output projection
         y_mem = attn.o_proj(y_mem)
 
-        # Gate
-        gate = torch.sigmoid(self.mem_gates[gate_idx])
+        # Gate (cast to hidden dtype to avoid float32 promotion)
+        gate = torch.sigmoid(self.mem_gates[gate_idx]).to(hidden_states.dtype)
         return gate * y_mem
 
     def write_memory(self, text):
