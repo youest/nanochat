@@ -797,20 +797,19 @@ def _start_server(wrapper, args):
     @app.post("/chat/completions")
     async def chat_completions(request: ChatRequest):
         """Streaming chat endpoint compatible with nanochat UI."""
-        # Build prompt from messages
-        parts = []
-        for msg in request.messages:
-            if msg.role == "user":
-                parts.append(f"User: {msg.content}")
-            elif msg.role == "assistant":
-                parts.append(f"Assistant: {msg.content}")
-        parts.append("Assistant:")
-        prompt = "\n".join(parts)
+        # Use Qwen chat template
+        chat_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        prompt = tokenizer.apply_chat_template(
+            chat_messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
 
         # Write latest user message to memory
         user_msgs = [m for m in request.messages if m.role == "user"]
         if user_msgs:
             wrapper.write_memory_selective(user_msgs[-1].content, top_k=args.top_k)
+
+        max_tokens = min(request.max_tokens or 128, 256)
 
         async def generate_stream():
             tokens_in = tokenizer(prompt, return_tensors="pt").to(device)
@@ -819,9 +818,10 @@ def _start_server(wrapper, args):
             with torch.no_grad():
                 output_ids = model.generate(
                     **tokens_in,
-                    max_new_tokens=request.max_tokens or 128,
-                    do_sample=request.temperature > 0,
-                    temperature=max(request.temperature or 0.7, 0.01),
+                    max_new_tokens=max_tokens,
+                    do_sample=True,
+                    temperature=max(request.temperature or 0.7, 0.1),
+                    repetition_penalty=1.3,
                 )
 
             gen_ids = output_ids[0, input_len:]
@@ -830,7 +830,7 @@ def _start_server(wrapper, args):
             # Write response to memory
             wrapper.write_memory_selective(full_response, top_k=args.top_k // 2)
 
-            # Stream token by token (simulated — Qwen generate is not streaming)
+            # Stream word by word
             words = full_response.split(" ")
             for i, word in enumerate(words):
                 token = (" " if i > 0 else "") + word
