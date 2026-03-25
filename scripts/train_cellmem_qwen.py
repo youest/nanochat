@@ -230,14 +230,13 @@ class CellMemWrapper(nn.Module):
         return outputs
 
     def generate(self, text, max_new_tokens=64):
-        """Generate text with memory active."""
+        """Generate text with memory active (greedy)."""
         tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
         with torch.no_grad():
             output_ids = self.base_model.generate(
                 **tokens,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                temperature=1.0,
             )
         # Decode only the generated part
         gen_ids = output_ids[0, tokens["input_ids"].size(1):]
@@ -333,7 +332,7 @@ def run_experiment(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map=device,
         trust_remote_code=True,
     )
@@ -460,7 +459,7 @@ def run_experiment(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-3)
