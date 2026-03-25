@@ -28,6 +28,7 @@ class CellMemConfig:
     max_vector_norm: float = 50.0
     write_mode: str = "raw"              # "raw" | "delta" (prediction-error writes)
     delta_threshold: float = 0.1         # min delta norm to write (skip if below)
+    min_novelty: float = 0.0             # min cosine distance to existing memories (0=off, 0.1=skip if >0.9 sim)
 
 
 class MemoryStore:
@@ -61,6 +62,13 @@ class MemoryStore:
         When full, overwrite the slot with lowest surprise score.
         In delta mode, writes prediction error instead of raw vector."""
         K = self.config.n_slots
+
+        # Decorrelation gate (DG pattern separation): skip if too similar to existing memories
+        if self.config.min_novelty > 0 and self.active_count > 0:
+            active = self.vectors[:self.active_count].to(vector.device)
+            sims = F.cosine_similarity(vector.unsqueeze(0), active, dim=-1)  # [A]
+            if sims.max().item() > (1.0 - self.config.min_novelty):
+                return  # too similar, skip write
 
         # Delta update rule: write only the prediction error
         if self.config.write_mode == "delta":

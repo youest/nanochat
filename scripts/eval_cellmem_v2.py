@@ -60,6 +60,20 @@ CONFIGS_ROUND2 = {
                                   surprise_threshold=2.0, n_slots=64, write_mode="delta"),
 }
 
+# Round 3 (DECORRELATION): test min_novelty (DG pattern separation) at different thresholds
+# Uses P90 surprise threshold from previous eval (12.0) instead of 2.0
+CONFIGS_ROUND3 = {
+    "baseline": None,
+    "no_decorr":   CellMemConfig(enabled=True, write_strategy="per_token", layers="mid",
+                                  surprise_threshold=12.0, n_slots=64, min_novelty=0.0),
+    "decorr_01":   CellMemConfig(enabled=True, write_strategy="per_token", layers="mid",
+                                  surprise_threshold=12.0, n_slots=64, min_novelty=0.1),
+    "decorr_02":   CellMemConfig(enabled=True, write_strategy="per_token", layers="mid",
+                                  surprise_threshold=12.0, n_slots=64, min_novelty=0.2),
+    "decorr_03":   CellMemConfig(enabled=True, write_strategy="per_token", layers="mid",
+                                  surprise_threshold=12.0, n_slots=64, min_novelty=0.3),
+}
+
 # Legacy alias for imports
 CONFIGS = CONFIGS_ROUND1
 
@@ -445,8 +459,8 @@ def main():
                         help="Device to use (default: auto-detect)")
     parser.add_argument("--force-gate", type=float, default=None,
                         help="Force mem_gates to this value (bypasses sigmoid(-10) init)")
-    parser.add_argument("--round", type=str, default="1", choices=["1", "2", "all"],
-                        help="Which eval round: 1=core (7 configs), 2=delta (raw vs delta), all=both")
+    parser.add_argument("--round", type=str, default="1", choices=["1", "2", "3", "all"],
+                        help="Which eval round: 1=core, 2=delta, 3=decorrelation, all=everything")
     args = parser.parse_args()
 
     # Auto-detect device
@@ -474,8 +488,12 @@ def main():
         configs = CONFIGS_ROUND1
     elif args.round == "2":
         configs = CONFIGS_ROUND2
+    elif args.round == "3":
+        configs = CONFIGS_ROUND3
     elif args.round == "all":
-        configs = {**CONFIGS_ROUND1, **{k: v for k, v in CONFIGS_ROUND2.items() if k != "baseline"}}
+        configs = {**CONFIGS_ROUND1,
+                   **{k: v for k, v in CONFIGS_ROUND2.items() if k != "baseline"},
+                   **{k: v for k, v in CONFIGS_ROUND3.items() if k != "baseline"}}
 
     print(f"Round {args.round}: {len(configs)} configurations")
 
