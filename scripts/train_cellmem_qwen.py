@@ -155,7 +155,10 @@ class CellMemWrapper(nn.Module):
         y_mem = F.scaled_dot_product_attention(
             Q, K_mem, V_mem, is_causal=False, enable_gqa=enable_gqa
         )
-        y_mem = y_mem.transpose(1, 2).contiguous().view(B, T, C)  # [B, T, C]
+        attn_out_dim = self.num_heads * self.head_dim  # may differ from hidden_size
+        y_mem = y_mem.transpose(1, 2).contiguous().view(B, T, attn_out_dim)
+        # Project back to hidden_size via the output projection
+        y_mem = attn.o_proj(y_mem)
 
         # Gate
         gate = torch.sigmoid(self.mem_gates[gate_idx])
