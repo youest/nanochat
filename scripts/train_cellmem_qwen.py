@@ -666,11 +666,13 @@ def run_experiment(args):
     )
     print(f"Trainable parameters: {wrapper.count_trainable():,}")
 
-    # Generate mixed training data
+    # Generate training data: positives for Phase 1, mixed for Phase 2 (Cascade approach)
     n_examples = args.n_examples
+    positive_data = _generate_procedural_data(n_examples, seed=42)
+    pos_train, pos_test = _split_data(positive_data, test_ratio=0.2, seed=42)
     mixed_data = _generate_mixed_data(n_examples, seed=42)
-    train_data, test_data = _split_data(mixed_data, test_ratio=0.2, seed=42)
-    print(f"\nData: {len(train_data)} train, {len(test_data)} test")
+    mix_train, mix_test = _split_data(mixed_data, test_ratio=0.2, seed=42)
+    print(f"\nData: {len(pos_train)} positive train, {len(mix_train)} mixed train, {len(mix_test)} mixed test")
 
     def eval_recall(data, label, show_examples=5):
         """Evaluate recall: generate answers with memory and check keyword overlap."""
@@ -713,66 +715,113 @@ def run_experiment(args):
         print(f"  Q: {ex['query']}")
         print(f"  A: {answer[:80]}")
 
-    # --- TRAINING ---
-    print("\n" + "=" * 60)
-    print("PHASE 2: TRAINING")
-    print("=" * 60)
-    optimizer = torch.optim.AdamW(wrapper.trainable_parameters(), lr=args.lr, weight_decay=0.01)
+    # --- CASCADE TRAINING (inspired by Nemotron-Cascade 2) ---
+    # Phase 1: positives only — learn to read from memory (gate opens)
+    # Phase 2: mixed data — learn when NOT to read (gate becomes selective)
+    # All phases use LM loss only — no gate supervision (gate learns from perplexity signal)
 
-    for epoch in range(args.epochs):
+    phase1_epochs = max(1, args.epochs * 2 // 3)  # 2/3 of epochs for foundation
+    phase2_epochs = args.epochs - phase1_epochs     # 1/3 for selectivity
+
+    # Separate LR for ContentGate (needs stronger signal, longer gradient path)
+    gate_params = []
+    lora_params = []
+    for cg in wrapper.content_gates:
+        gate_params.extend(cg.parameters())
+    gate_params.extend(wrapper.mem_rms_norm.parameters())
+    lora_params.extend(wrapper.lora_layers.parameters())
+
+    optimizer = torch.optim.AdamW([
+        {"params": lora_params, "lr": args.lr},
+        {"params": gate_params, "lr": args.lr * 10},  # 10x LR for gate
+    ], weight_decay=0.01)
+
+    # --- Phase 1: Positives only ---
+    print("\n" + "=" * 60)
+    print(f"PHASE 2a: CASCADE TRAINING — positives only ({phase1_epochs} epochs)")
+    print("=" * 60)
+
+    for epoch in range(phase1_epochs):
         total_loss = 0.0
         n = 0
-        epoch_data = list(train_data)
+        epoch_data = list(pos_train)
         _random.shuffle(epoch_data)
 
         for ex in epoch_data:
             wrapper.clear_memory()
             wrapper._last_gate_values = []
             wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-
             if wrapper.memory_count == 0:
                 continue
 
-            ex_type = ex.get("type", "positive")
             optimizer.zero_grad()
-
-            if ex_type == "positive":
-                lm_loss = compute_retrieval_loss(wrapper, tokenizer,
-                                                  ex["query"], ex["answer"], device)
-                gate_vals = wrapper._last_gate_values
-                g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="open") if gate_vals else 0.0
-                loss = lm_loss + 0.1 * g_loss
-
-            elif ex_type == "negative":
-                prompt = ex["query"] + " " + ex["answer"]
-                tokens = tokenizer(prompt, return_tensors="pt").to(device)
-                wrapper(input_ids=tokens["input_ids"])
-                gate_vals = wrapper._last_gate_values
-                loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close") if gate_vals else torch.tensor(0.0)
-
-            elif ex_type == "poisoned":
-                lm_loss = compute_retrieval_loss(wrapper, tokenizer,
-                                                  ex["query"], ex["answer"], device)
-                gate_vals = wrapper._last_gate_values
-                g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close") if gate_vals else 0.0
-                loss = lm_loss + 0.1 * g_loss
-            else:
-                continue
-
+            loss = compute_retrieval_loss(wrapper, tokenizer,
+                                          ex["query"], ex["answer"], device)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             n += 1
 
         avg_loss = total_loss / max(n, 1)
-        if epoch % 5 == 0 or epoch == args.epochs - 1:
+        if epoch % 5 == 0 or epoch == phase1_epochs - 1:
             print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
 
-    # --- EVAL ---
+    # Save Phase 1 checkpoint (for MOPD recovery if Phase 2 degrades)
+    phase1_path = args.save_path.replace(".pt", "_phase1.pt")
+    wrapper.save_lora(phase1_path)
+
+    # Mid-training eval
+    print("\n  --- Phase 1 eval (positives only) ---")
+    pos_only_test = [e for e in mix_test if e.get("type") == "positive"]
+    if pos_only_test:
+        hits = 0
+        for ex in pos_only_test[:20]:
+            wrapper.clear_memory()
+            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
+            gen = wrapper.generate(ex["query"], max_new_tokens=32)
+            stopwords = {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and"}
+            answer_words = set(ex["answer"].lower().split()) - stopwords
+            matched = sum(1 for w in answer_words if w in gen.lower())
+            if matched / max(len(answer_words), 1) > 0.5:
+                hits += 1
+        print(f"  Phase 1 recall: {hits}/{min(len(pos_only_test), 20)} ({hits/min(len(pos_only_test),20)*100:.0f}%)")
+
+    # --- Phase 2: Mixed data (positives + negatives + poisoned) ---
+    print("\n" + "=" * 60)
+    print(f"PHASE 2b: CASCADE TRAINING — mixed data ({phase2_epochs} epochs)")
+    print("=" * 60)
+
+    for epoch in range(phase2_epochs):
+        total_loss = 0.0
+        n = 0
+        epoch_data = list(mix_train)
+        _random.shuffle(epoch_data)
+
+        for ex in epoch_data:
+            wrapper.clear_memory()
+            wrapper._last_gate_values = []
+            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
+            if wrapper.memory_count == 0:
+                continue
+
+            optimizer.zero_grad()
+            # LM loss for ALL types — gate learns from perplexity signal
+            loss = compute_retrieval_loss(wrapper, tokenizer,
+                                          ex["query"], ex["answer"], device)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            n += 1
+
+        avg_loss = total_loss / max(n, 1)
+        if epoch % 5 == 0 or epoch == phase2_epochs - 1:
+            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
+
+    # --- COMPREHENSIVE EVAL ---
     print("\n" + "=" * 60)
     print("PHASE 3: COMPREHENSIVE EVAL")
     print("=" * 60)
-    metrics = eval_comprehensive(wrapper, tokenizer, test_data, device)
+    metrics = eval_comprehensive(wrapper, tokenizer, mix_test, device)
 
     # Save LoRA weights
     wrapper.save_lora(args.save_path)
