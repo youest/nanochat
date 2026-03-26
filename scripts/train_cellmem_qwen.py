@@ -790,18 +790,39 @@ def run_experiment(args):
                 hits += 1
         print(f"  Phase 1 recall: {hits}/{min(len(pos_only_test), 20)} ({hits/min(len(pos_only_test),20)*100:.0f}%)")
 
-    # --- Phase 2: Gate unfrozen, learns WHEN on mixed data ---
-    # Unfreeze gate + add to optimizer with 10x LR
+    # --- Phase 2: Gate unfrozen, LoRA FROZEN ---
+    # Gate is the ONLY trainable component. This forces ALL gradient signal
+    # into the gate instead of LoRA absorbing it (LoRA has a much shorter
+    # gradient path and would steal all the signal otherwise).
+    for p in lora_params:
+        p.requires_grad = False
     for p in gate_params:
         p.requires_grad = True
 
     optimizer = torch.optim.AdamW([
-        {"params": lora_params, "lr": args.lr * 0.3},  # Lower LR for LoRA (fine-tune)
-        {"params": gate_params, "lr": args.lr * 10},    # 10x LR for gate (needs to learn fast)
-    ], weight_decay=0.01)
+        {"params": gate_params, "lr": args.lr * 200},  # Very high LR: gradient is diluted through 18 frozen layers
+    ], weight_decay=0.0)  # No weight decay on gate (don't pull base toward 0)
+
+    # --- Gradient diagnostic: verify gradient reaches gate_base ---
+    print("\n  --- Phase 2 gradient diagnostic ---")
+    wrapper.clear_memory()
+    _diag_ex = mix_train[0]
+    wrapper.write_memory_selective(_diag_ex["context"], top_k=args.top_k)
+    if wrapper.memory_count > 0:
+        optimizer.zero_grad()
+        _diag_loss = compute_retrieval_loss(wrapper, tokenizer,
+                                            _diag_ex["query"], _diag_ex["answer"], device)
+        _diag_loss.backward()
+        for i, cg in enumerate(wrapper.content_gates):
+            g = cg.base.grad
+            print(f"  gate[{i}].base.grad = {g.item() if g is not None else 'NONE':.2e}")
+            for name, p in cg.net.named_parameters():
+                grad_str = f"{p.grad.abs().mean().item():.2e}" if p.grad is not None else "NONE"
+                print(f"  gate[{i}].net.{name}.grad = {grad_str}")
+        optimizer.zero_grad()
 
     print("\n" + "=" * 60)
-    print(f"PHASE 2: ANNEALING — gate unfrozen + clamp ({phase2_epochs} epochs)")
+    print(f"PHASE 2: ANNEALING — gate only, LoRA frozen ({phase2_epochs} epochs)")
     print("=" * 60)
 
     for epoch in range(phase2_epochs):
