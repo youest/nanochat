@@ -28,9 +28,9 @@ class LoRALinear(nn.Module):
         self.lora_A = nn.Linear(base.in_features, rank, bias=False)
         self.lora_B = nn.Linear(rank, base.out_features, bias=False)
         self.scale = scale
-        # Init: A normal, B zero -> LoRA starts as identity
+        # Init: A normal, B small random (NOT zero — zero blocks gradient to A)
         nn.init.normal_(self.lora_A.weight, std=0.02)
-        nn.init.zeros_(self.lora_B.weight)
+        nn.init.normal_(self.lora_B.weight, std=1e-3)
         # Freeze base
         for p in self.base.parameters():
             p.requires_grad = False
