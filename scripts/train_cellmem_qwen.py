@@ -733,62 +733,51 @@ def run_experiment(args):
     lora_params.extend(wrapper.lora_layers.parameters())
 
     # --- Phase 1: Gate frozen, LoRA learns on mixed data ---
-    # Freeze gate: like a thermostat locked at 0.5
-    for p in gate_params:
-        p.requires_grad = False
+    if args.resume_phase2:
+        print(f"\n  Resuming from Phase 1 checkpoint: {args.resume_phase2}")
+        wrapper.load_lora(args.resume_phase2)
+        print("  Phase 1 skipped (loaded checkpoint)")
+    else:
+        # Freeze gate: like a thermostat locked at 0.5
+        for p in gate_params:
+            p.requires_grad = False
 
-    optimizer = torch.optim.AdamW([
-        {"params": lora_params, "lr": args.lr},
-    ], weight_decay=0.01)
+        optimizer = torch.optim.AdamW([
+            {"params": lora_params, "lr": args.lr},
+        ], weight_decay=0.01)
 
-    print("\n" + "=" * 60)
-    print(f"PHASE 1: ANNEALING — gate frozen, mixed data ({phase1_epochs} epochs)")
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print(f"PHASE 1: ANNEALING — gate frozen, mixed data ({phase1_epochs} epochs)")
+        print("=" * 60)
 
-    for epoch in range(phase1_epochs):
-        total_loss = 0.0
-        n = 0
-        epoch_data = list(mix_train)
-        _random.shuffle(epoch_data)
+        for epoch in range(phase1_epochs):
+            total_loss = 0.0
+            n = 0
+            epoch_data = list(mix_train)
+            _random.shuffle(epoch_data)
 
-        for ex in epoch_data:
-            wrapper.clear_memory()
-            wrapper._last_gate_values = []
-            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-            if wrapper.memory_count == 0:
-                continue
+            for ex in epoch_data:
+                wrapper.clear_memory()
+                wrapper._last_gate_values = []
+                wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
+                if wrapper.memory_count == 0:
+                    continue
 
-            optimizer.zero_grad()
-            loss = compute_retrieval_loss(wrapper, tokenizer,
-                                          ex["query"], ex["answer"], device)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            n += 1
+                optimizer.zero_grad()
+                loss = compute_retrieval_loss(wrapper, tokenizer,
+                                              ex["query"], ex["answer"], device)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+                n += 1
 
-        avg_loss = total_loss / max(n, 1)
-        if epoch % 5 == 0 or epoch == phase1_epochs - 1:
-            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
+            avg_loss = total_loss / max(n, 1)
+            if epoch % 5 == 0 or epoch == phase1_epochs - 1:
+                print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
 
-    # Save Phase 1 checkpoint
-    phase1_path = args.save_path.replace(".pt", "_phase1.pt")
-    wrapper.save_lora(phase1_path)
-
-    # Mid-training eval
-    print("\n  --- Phase 1 eval (gate frozen at 0.5) ---")
-    pos_only_test = [e for e in mix_test if e.get("type") == "positive"]
-    if pos_only_test:
-        hits = 0
-        for ex in pos_only_test[:20]:
-            wrapper.clear_memory()
-            wrapper.write_memory_selective(ex["context"], top_k=args.top_k)
-            gen = wrapper.generate(ex["query"], max_new_tokens=32)
-            stopwords = {"the", "a", "an", "is", "was", "are", "of", "in", "to", "and"}
-            answer_words = set(ex["answer"].lower().split()) - stopwords
-            matched = sum(1 for w in answer_words if w in gen.lower())
-            if matched / max(len(answer_words), 1) > 0.5:
-                hits += 1
-        print(f"  Phase 1 recall: {hits}/{min(len(pos_only_test), 20)} ({hits/min(len(pos_only_test),20)*100:.0f}%)")
+        # Save Phase 1 checkpoint
+        phase1_path = args.save_path.replace(".pt", "_phase1.pt")
+        wrapper.save_lora(phase1_path)
 
     # --- Phase 2: Gate unfrozen, LoRA FROZEN ---
     # Gate is the ONLY trainable component. This forces ALL gradient signal
@@ -924,6 +913,8 @@ def main():
                         help="After training (or loading), start web UI")
     parser.add_argument("--load-lora", type=str, default=None,
                         help="Load pre-trained LoRA weights (skip training)")
+    parser.add_argument("--resume-phase2", type=str, default=None,
+                        help="Load Phase 1 checkpoint and skip to Phase 2")
     parser.add_argument("--port", type=int, default=8001)
     args = parser.parse_args()
 
