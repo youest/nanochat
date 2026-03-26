@@ -57,7 +57,14 @@ class ContentGate(torch.nn.Module):
 
     def forward(self, h_local: torch.Tensor, h_mem: torch.Tensor) -> torch.Tensor:
         x = torch.cat([h_local, h_mem, h_local - h_mem], dim=-1)
-        return torch.sigmoid(self.base + self.net(x))
+        # Pupil range [0.1, 0.9]: never fully open or close.
+        # Prevents gradient death at sigmoid extremes.
+        return 0.1 + 0.8 * torch.sigmoid(self.base + self.net(x))
+
+    def clamp_base(self, min_val: float = -2.0, max_val: float = 2.0):
+        """Canal lock: keep tonic base in sensitive sigmoid region.
+        sigmoid(-2)=0.12, sigmoid(2)=0.88 → gradient always flows."""
+        self.base.data.clamp_(min_val, max_val)
 
 
 class MemoryRMSNorm(torch.nn.Module):

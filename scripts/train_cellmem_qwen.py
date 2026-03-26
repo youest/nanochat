@@ -715,15 +715,16 @@ def run_experiment(args):
         print(f"  Q: {ex['query']}")
         print(f"  A: {answer[:80]}")
 
-    # --- CASCADE TRAINING (inspired by Nemotron-Cascade 2) ---
-    # Phase 1: positives only — learn to read from memory (gate opens)
-    # Phase 2: mixed data — learn when NOT to read (gate becomes selective)
-    # All phases use LM loss only — no gate supervision (gate learns from perplexity signal)
+    # --- ANNEALING TRAINING (Ricottura + Chiusa + Pupilla) ---
+    # Phase 1: Mixed data, gate FROZEN at 0.5, LM loss only → LoRA learns HOW to use memory
+    # Phase 2: Mixed data, gate UNFROZEN + clamp, LM loss only → gate learns WHEN to use memory
+    # No gate supervision: the LM gradient naturally teaches the gate.
+    # Like the brain: first synapses form (LoRA), then ACh modulation calibrates (gate).
 
-    phase1_epochs = max(1, args.epochs * 2 // 3)  # 2/3 of epochs for foundation
-    phase2_epochs = args.epochs - phase1_epochs     # 1/3 for selectivity
+    phase1_epochs = max(1, args.epochs * 2 // 3)  # 2/3 for LoRA (gate frozen)
+    phase2_epochs = args.epochs - phase1_epochs     # 1/3 for gate learning
 
-    # Separate LR for ContentGate (needs stronger signal, longer gradient path)
+    # Collect parameter groups
     gate_params = []
     lora_params = []
     for cg in wrapper.content_gates:
@@ -731,20 +732,23 @@ def run_experiment(args):
     gate_params.extend(wrapper.mem_rms_norm.parameters())
     lora_params.extend(wrapper.lora_layers.parameters())
 
+    # --- Phase 1: Gate frozen, LoRA learns on mixed data ---
+    # Freeze gate: like a thermostat locked at 0.5
+    for p in gate_params:
+        p.requires_grad = False
+
     optimizer = torch.optim.AdamW([
         {"params": lora_params, "lr": args.lr},
-        {"params": gate_params, "lr": args.lr * 10},  # 10x LR for gate
     ], weight_decay=0.01)
 
-    # --- Phase 1: Positives only ---
     print("\n" + "=" * 60)
-    print(f"PHASE 2a: CASCADE TRAINING — positives only ({phase1_epochs} epochs)")
+    print(f"PHASE 1: ANNEALING — gate frozen, mixed data ({phase1_epochs} epochs)")
     print("=" * 60)
 
     for epoch in range(phase1_epochs):
         total_loss = 0.0
         n = 0
-        epoch_data = list(pos_train)
+        epoch_data = list(mix_train)
         _random.shuffle(epoch_data)
 
         for ex in epoch_data:
@@ -766,12 +770,12 @@ def run_experiment(args):
         if epoch % 5 == 0 or epoch == phase1_epochs - 1:
             print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
 
-    # Save Phase 1 checkpoint (for MOPD recovery if Phase 2 degrades)
+    # Save Phase 1 checkpoint
     phase1_path = args.save_path.replace(".pt", "_phase1.pt")
     wrapper.save_lora(phase1_path)
 
     # Mid-training eval
-    print("\n  --- Phase 1 eval (positives only) ---")
+    print("\n  --- Phase 1 eval (gate frozen at 0.5) ---")
     pos_only_test = [e for e in mix_test if e.get("type") == "positive"]
     if pos_only_test:
         hits = 0
@@ -786,9 +790,18 @@ def run_experiment(args):
                 hits += 1
         print(f"  Phase 1 recall: {hits}/{min(len(pos_only_test), 20)} ({hits/min(len(pos_only_test),20)*100:.0f}%)")
 
-    # --- Phase 2: Mixed data (positives + negatives + poisoned) ---
+    # --- Phase 2: Gate unfrozen, learns WHEN on mixed data ---
+    # Unfreeze gate + add to optimizer with 10x LR
+    for p in gate_params:
+        p.requires_grad = True
+
+    optimizer = torch.optim.AdamW([
+        {"params": lora_params, "lr": args.lr * 0.3},  # Lower LR for LoRA (fine-tune)
+        {"params": gate_params, "lr": args.lr * 10},    # 10x LR for gate (needs to learn fast)
+    ], weight_decay=0.01)
+
     print("\n" + "=" * 60)
-    print(f"PHASE 2b: CASCADE TRAINING — mixed data ({phase2_epochs} epochs)")
+    print(f"PHASE 2: ANNEALING — gate unfrozen + clamp ({phase2_epochs} epochs)")
     print("=" * 60)
 
     for epoch in range(phase2_epochs):
@@ -804,33 +817,28 @@ def run_experiment(args):
             if wrapper.memory_count == 0:
                 continue
 
-            ex_type = ex.get("type", "positive")
             optimizer.zero_grad()
-
-            # LM loss for all types
-            lm_loss = compute_retrieval_loss(wrapper, tokenizer,
-                                              ex["query"], ex["answer"], device)
-
-            if ex_type == "positive":
-                # Positives: LM loss only (gate already open from Phase 2a)
-                loss = lm_loss
-            else:
-                # Negatives + poisoned: LM loss + gate supervision (push gate toward 0)
-                gate_vals = wrapper._last_gate_values
-                if gate_vals:
-                    g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close")
-                    loss = lm_loss + 0.5 * g_loss
-                else:
-                    loss = lm_loss
-
+            # Pure LM loss — no gate supervision. Let the gradient teach the gate
+            # naturally: memory helps → lower loss → gate stays open,
+            # memory hurts → higher loss → gradient pushes gate closed.
+            loss = compute_retrieval_loss(wrapper, tokenizer,
+                                          ex["query"], ex["answer"], device)
             loss.backward()
             optimizer.step()
+
+            # Canal lock: clamp gate bases to prevent saturation
+            for cg in wrapper.content_gates:
+                cg.clamp_base()
+
             total_loss += loss.item()
             n += 1
 
         avg_loss = total_loss / max(n, 1)
         if epoch % 5 == 0 or epoch == phase2_epochs - 1:
-            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n}")
+            # Report gate values for monitoring
+            gate_base_vals = [cg.base.item() for cg in wrapper.content_gates]
+            gate_str = ", ".join(f"{v:.2f}" for v in gate_base_vals)
+            print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n} | gate_base=[{gate_str}]")
 
     # --- COMPREHENSIVE EVAL ---
     print("\n" + "=" * 60)

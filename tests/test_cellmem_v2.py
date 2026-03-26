@@ -411,7 +411,7 @@ class TestDeltaUpdateRuleRawMode:
 
 
 class TestContentGate:
-    """Content-dependent gate (CA1 comparator): gate = sigmoid(MLP([h_local; h_mem; h_local - h_mem]))"""
+    """Content-dependent gate (CA1 comparator) with pupil range [0.1, 0.9]."""
 
     def test_output_shape(self):
         from nanochat.cellmem_v2 import ContentGate
@@ -420,7 +420,8 @@ class TestContentGate:
         h_mem = torch.randn(2, 10, 64)
         g = gate(h_local, h_mem)
         assert g.shape == (2, 10, 1), f"Expected (2, 10, 1), got {g.shape}"
-        assert (g >= 0).all() and (g <= 1).all(), "Gate values must be in [0, 1]"
+        assert (g >= 0.1 - 1e-6).all() and (g <= 0.9 + 1e-6).all(), \
+            f"Gate values must be in [0.1, 0.9] (pupil range), got [{g.min():.4f}, {g.max():.4f}]"
 
     def test_gradient_flows(self):
         from nanochat.cellmem_v2 import ContentGate
@@ -449,6 +450,118 @@ class TestContentGate:
         g = gate(h_local, h_mem)
         assert g.item() == pytest.approx(0.5, abs=0.01), \
             f"Gate should start at ~0.5 (zero-init last layer), got {g.item()}"
+
+
+class TestContentGatePupilRange:
+    """Pupil range: gate output bounded to [0.1, 0.9] to prevent sigmoid saturation.
+    Like a biological pupil that can never fully open or close."""
+
+    def test_extreme_positive_base_stays_bounded(self):
+        """Even with scalar_base=100, output must stay <= 0.9."""
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=64)
+        with torch.no_grad():
+            gate.base.fill_(100.0)
+        h = torch.randn(1, 4, 64)
+        g = gate(h, h)
+        assert g.max().item() <= 0.9 + 1e-6, f"Gate exceeded 0.9: {g.max().item()}"
+
+    def test_extreme_negative_base_stays_bounded(self):
+        """Even with scalar_base=-100, output must stay >= 0.1."""
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=64)
+        with torch.no_grad():
+            gate.base.fill_(-100.0)
+        h = torch.randn(1, 4, 64)
+        g = gate(h, h)
+        assert g.min().item() >= 0.1 - 1e-6, f"Gate went below 0.1: {g.min().item()}"
+
+
+class TestGateBaseClamping:
+    """Canal lock: clamp scalar_base to [-2, 2] to keep sigmoid in sensitive region."""
+
+    def test_clamp_base_exists(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=32)
+        assert hasattr(gate, 'clamp_base'), "ContentGate must have clamp_base method"
+
+    def test_clamp_limits_extreme_positive(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=32)
+        with torch.no_grad():
+            gate.base.fill_(10.0)
+        gate.clamp_base()
+        assert gate.base.item() <= 2.0 + 1e-6
+
+    def test_clamp_limits_extreme_negative(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=32)
+        with torch.no_grad():
+            gate.base.fill_(-10.0)
+        gate.clamp_base()
+        assert gate.base.item() >= -2.0 - 1e-6
+
+    def test_clamp_preserves_normal_values(self):
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=32)
+        with torch.no_grad():
+            gate.base.fill_(1.5)
+        gate.clamp_base()
+        assert gate.base.item() == pytest.approx(1.5, abs=1e-5)
+
+
+class TestGateAntiSaturation:
+    """The core thesis: with pupil range + clamp, gate can be pushed DOWN
+    after being trained UP. This is the 'annealing' guarantee."""
+
+    def test_gradient_survives_after_clamp(self):
+        """After extreme base → clamp, gradient on base must be nonzero."""
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=64)
+        with torch.no_grad():
+            gate.base.fill_(10.0)
+        gate.clamp_base()  # base → 2.0
+        h = torch.randn(1, 4, 64)
+        g = gate(h, h)
+        loss = g.mean()  # try to push gate down
+        loss.backward()
+        assert gate.base.grad is not None
+        assert gate.base.grad.abs().item() > 1e-4, \
+            f"Gradient died after clamp: {gate.base.grad.abs().item()}"
+
+    def test_gate_reversible_with_clamp(self):
+        """Train gate UP for 50 steps, then DOWN for 50 steps.
+        With clamp, gate must actually move down. This is the scenario
+        that failed with plain sigmoid (saturation killed gradients)."""
+        from nanochat.cellmem_v2 import ContentGate
+        gate = ContentGate(d_model=32)
+        opt = torch.optim.SGD(gate.parameters(), lr=0.1)
+        h = torch.randn(1, 4, 32)
+
+        # Phase 1: push gate UP (positive-only training)
+        for _ in range(50):
+            opt.zero_grad()
+            g = gate(h, h)
+            loss = (1.0 - g).mean()
+            loss.backward()
+            opt.step()
+            gate.clamp_base()
+
+        gate_up = gate(h, h).mean().item()
+
+        # Phase 2: push gate DOWN (negative training)
+        for _ in range(50):
+            opt.zero_grad()
+            g = gate(h, h)
+            loss = g.mean()
+            loss.backward()
+            opt.step()
+            gate.clamp_base()
+
+        gate_down = gate(h, h).mean().item()
+
+        assert gate_down < gate_up - 0.1, \
+            f"Gate didn't reverse: up={gate_up:.3f} → down={gate_down:.3f}"
 
 
 class TestMemoryRMSNorm:
