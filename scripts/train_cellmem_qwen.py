@@ -804,10 +804,25 @@ def run_experiment(args):
             if wrapper.memory_count == 0:
                 continue
 
+            ex_type = ex.get("type", "positive")
             optimizer.zero_grad()
-            # LM loss for ALL types — gate learns from perplexity signal
-            loss = compute_retrieval_loss(wrapper, tokenizer,
-                                          ex["query"], ex["answer"], device)
+
+            # LM loss for all types
+            lm_loss = compute_retrieval_loss(wrapper, tokenizer,
+                                              ex["query"], ex["answer"], device)
+
+            if ex_type == "positive":
+                # Positives: LM loss only (gate already open from Phase 2a)
+                loss = lm_loss
+            else:
+                # Negatives + poisoned: LM loss + gate supervision (push gate toward 0)
+                gate_vals = wrapper._last_gate_values
+                if gate_vals:
+                    g_loss = compute_gate_loss(torch.cat(gate_vals, dim=1), target="close")
+                    loss = lm_loss + 0.5 * g_loss
+                else:
+                    loss = lm_loss
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
