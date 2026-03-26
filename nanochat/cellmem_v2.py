@@ -32,12 +32,21 @@ class CellMemConfig:
 
 
 class ContentGate(torch.nn.Module):
-    """Content-dependent gate (CA1 comparator).
-    gate = sigmoid(W2 @ GELU(W1 @ [h_local; h_mem; h_local - h_mem]))
-    Initialized so output starts at sigmoid(0) = 0.5 (neutral).
+    """Content-dependent gate (CA1 comparator) with tonic + phasic architecture.
+
+    gate = sigmoid(scalar_base + MLP([h_local; h_mem; h_local - h_mem]))
+
+    - scalar_base: tonic baseline (like ACh tonic level) — learns overall memory usage
+    - MLP: phasic adjustment — learns per-token when memory is useful vs noise
+
+    MLP initialized to 0 output → starts as pure scalar gate (known to work).
+    As training progresses, MLP learns to modulate around the base.
     """
     def __init__(self, d_model: int):
         super().__init__()
+        # Tonic: scalar base (like the old gate, init to 0 → sigmoid=0.5)
+        self.base = torch.nn.Parameter(torch.zeros(1))
+        # Phasic: small MLP adjustment, zero-init output → starts as no-op
         self.net = torch.nn.Sequential(
             torch.nn.Linear(3 * d_model, d_model // 4),
             torch.nn.GELU(),
@@ -48,7 +57,7 @@ class ContentGate(torch.nn.Module):
 
     def forward(self, h_local: torch.Tensor, h_mem: torch.Tensor) -> torch.Tensor:
         x = torch.cat([h_local, h_mem, h_local - h_mem], dim=-1)
-        return torch.sigmoid(self.net(x))
+        return torch.sigmoid(self.base + self.net(x))
 
 
 class MemoryRMSNorm(torch.nn.Module):
