@@ -839,11 +839,27 @@ def run_experiment(args):
                 continue
 
             optimizer.zero_grad()
-            # Pure LM loss — no gate supervision. Let the gradient teach the gate
-            # naturally: memory helps → lower loss → gate stays open,
-            # memory hurts → higher loss → gradient pushes gate closed.
-            loss = compute_retrieval_loss(wrapper, tokenizer,
-                                          ex["query"], ex["answer"], device)
+            ex_type = ex.get("type", "positive")
+
+            # LM loss (keeps LoRA-learned retrieval quality intact)
+            lm_loss = compute_retrieval_loss(wrapper, tokenizer,
+                                              ex["query"], ex["answer"], device)
+
+            # Direct gate supervision (LeWorldModel principle: don't rely on
+            # diluted task-loss gradient — add a direct auxiliary loss).
+            # With pupil range [0.1, 0.9], BCE gradient stays healthy at all times.
+            gate_vals = wrapper._last_gate_values
+            if gate_vals:
+                gate_cat = torch.cat(gate_vals, dim=1)  # [B, T, 1]
+                if ex_type == "positive":
+                    gate_target = torch.ones_like(gate_cat) * 0.9   # pupil max
+                else:
+                    gate_target = torch.ones_like(gate_cat) * 0.1   # pupil min
+                g_loss = F.binary_cross_entropy(gate_cat, gate_target)
+                loss = lm_loss + 0.5 * g_loss
+            else:
+                loss = lm_loss
+
             loss.backward()
             optimizer.step()
 
@@ -856,9 +872,9 @@ def run_experiment(args):
 
         avg_loss = total_loss / max(n, 1)
         if epoch % 5 == 0 or epoch == phase2_epochs - 1:
-            # Report gate values for monitoring
+            # Report gate base + quick per-type gate probe
             gate_base_vals = [cg.base.item() for cg in wrapper.content_gates]
-            gate_str = ", ".join(f"{v:.2f}" for v in gate_base_vals)
+            gate_str = ", ".join(f"{v:.3f}" for v in gate_base_vals)
             print(f"  Epoch {epoch:3d} | loss={avg_loss:.4f} | n={n} | gate_base=[{gate_str}]")
 
     # --- COMPREHENSIVE EVAL ---
