@@ -709,7 +709,7 @@ def run_experiment(args):
     print("PHASE 1: BASELINE (no memory)")
     print("=" * 60)
     wrapper.clear_memory()
-    baseline_examples = train_data[:5]
+    baseline_examples = pos_train[:5]
     for ex in baseline_examples:
         answer = wrapper.generate(ex["query"], max_new_tokens=32)
         print(f"  Q: {ex['query']}")
