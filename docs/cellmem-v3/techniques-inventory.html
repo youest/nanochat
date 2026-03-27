@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CellMem v3 -- Techniques Inventory</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-card: #161b22;
+    --bg-card-hover: #1c2230;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --text-dim: #6e7681;
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.08);
+    --green-border: rgba(63, 185, 80, 0.25);
+    --purple: #bc8cff;
+    --purple-bg: rgba(188, 140, 255, 0.08);
+    --purple-border: rgba(188, 140, 255, 0.25);
+    --red: #f97583;
+    --red-bg: rgba(249, 117, 131, 0.08);
+    --red-border: rgba(249, 117, 131, 0.25);
+    --blue: #58a6ff;
+    --blue-bg: rgba(88, 166, 255, 0.08);
+    --blue-border: rgba(88, 166, 255, 0.25);
+    --orange: #d29922;
+    --cyan: #56d4dd;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    padding: 2rem 1rem;
+  }
+
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+  }
+
+  /* Header */
+  header {
+    text-align: center;
+    margin-bottom: 3rem;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    margin-bottom: 0.25rem;
+  }
+
+  header h1 .v3 {
+    background: linear-gradient(135deg, var(--purple), var(--blue));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  header .subtitle {
+    color: var(--text-muted);
+    font-size: 1.05rem;
+  }
+
+  /* Stats row */
+  .stats {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    margin-top: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .stat {
+    text-align: center;
+  }
+
+  .stat-number {
+    font-size: 1.8rem;
+    font-weight: 700;
+    display: block;
+    line-height: 1.2;
+  }
+
+  .stat-label {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+  }
+
+  .stat-kept .stat-number { color: var(--green); }
+  .stat-evolved .stat-number { color: var(--purple); }
+  .stat-dropped .stat-number { color: var(--red); }
+
+  /* Design decisions */
+  .design-decisions {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem 2rem;
+    margin-bottom: 3rem;
+  }
+
+  .design-decisions h2 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--cyan);
+    margin-bottom: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .design-decisions h2::before {
+    content: "";
+    display: inline-block;
+    width: 3px;
+    height: 1.1em;
+    background: var(--cyan);
+    border-radius: 2px;
+  }
+
+  .decisions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 0.6rem 2rem;
+  }
+
+  .decision {
+    display: flex;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+  }
+
+  .decision-key {
+    color: var(--text-muted);
+    white-space: nowrap;
+    min-width: fit-content;
+  }
+
+  .decision-key::after {
+    content: ":";
+  }
+
+  .decision-val {
+    color: var(--text);
+  }
+
+  /* Sections */
+  .section {
+    margin-bottom: 3rem;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1.25rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 2px solid var(--border);
+  }
+
+  .section-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .section-kept .section-dot { background: var(--green); box-shadow: 0 0 8px rgba(63,185,80,0.4); }
+  .section-evolved .section-dot { background: var(--purple); box-shadow: 0 0 8px rgba(188,140,255,0.4); }
+  .section-dropped .section-dot { background: var(--red); box-shadow: 0 0 8px rgba(249,117,131,0.4); }
+
+  .section-header h2 {
+    font-size: 1.3rem;
+    font-weight: 600;
+  }
+
+  .section-kept .section-header h2 { color: var(--green); }
+  .section-evolved .section-header h2 { color: var(--purple); }
+  .section-dropped .section-header h2 { color: var(--red); }
+
+  .section-count {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.1rem 0.6rem;
+  }
+
+  /* Cards */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 0.75rem;
+    transition: background 0.15s, border-color 0.15s;
+    border-left: 3px solid transparent;
+  }
+
+  .card:hover {
+    background: var(--bg-card-hover);
+  }
+
+  .section-kept .card { border-left-color: var(--green); }
+  .section-evolved .card { border-left-color: var(--purple); }
+  .section-dropped .card { border-left-color: var(--red); }
+
+  .card-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.4rem;
+    flex-wrap: wrap;
+  }
+
+  .card-title {
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .card-desc {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    margin-bottom: 0.75rem;
+  }
+
+  /* Badges */
+  .badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.15rem 0.55rem;
+    border-radius: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .badge-paper {
+    color: var(--orange);
+    background: rgba(210, 153, 34, 0.12);
+    border: 1px solid rgba(210, 153, 34, 0.3);
+  }
+
+  .badge-original {
+    color: var(--blue);
+    background: var(--blue-bg);
+    border: 1px solid var(--blue-border);
+  }
+
+  .badge-neuroscience {
+    color: var(--cyan);
+    background: rgba(86, 212, 221, 0.1);
+    border: 1px solid rgba(86, 212, 221, 0.3);
+  }
+
+  /* Source line */
+  .card-source {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-top: 0.5rem;
+  }
+
+  .card-source strong {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  /* Evolution block */
+  .evolution {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 0.5rem;
+    align-items: center;
+    background: rgba(0,0,0,0.2);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin: 0.75rem 0;
+    font-size: 0.85rem;
+  }
+
+  .evo-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    margin-bottom: 0.15rem;
+  }
+
+  .evo-old {
+    color: var(--text-muted);
+  }
+
+  .evo-arrow {
+    color: var(--purple);
+    font-size: 1.2rem;
+    font-weight: 700;
+  }
+
+  .evo-new {
+    color: var(--text);
+  }
+
+  /* Dropped reason */
+  .drop-reason {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    background: rgba(249, 117, 131, 0.05);
+    border-left: 2px solid var(--red);
+    padding: 0.5rem 0.75rem;
+    margin-top: 0.5rem;
+    border-radius: 0 4px 4px 0;
+  }
+
+  .drop-reason strong {
+    color: var(--red);
+    font-weight: 500;
+  }
+
+  /* Papers section */
+  .papers {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem 2rem;
+    margin-top: 3rem;
+  }
+
+  .papers h2 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--orange);
+    margin-bottom: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .papers h2::before {
+    content: "";
+    display: inline-block;
+    width: 3px;
+    height: 1.1em;
+    background: var(--orange);
+    border-radius: 2px;
+  }
+
+  .papers ul {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 0.4rem 2rem;
+  }
+
+  .papers li {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    padding: 0.25rem 0;
+  }
+
+  .papers li strong {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .papers li code {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    background: rgba(0,0,0,0.3);
+    padding: 0.1rem 0.35rem;
+    border-radius: 3px;
+  }
+
+  /* Footer */
+  footer {
+    text-align: center;
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 0.8rem;
+  }
+
+  /* Responsive */
+  @media (max-width: 600px) {
+    body { padding: 1rem 0.5rem; }
+    header h1 { font-size: 1.6rem; }
+    .stats { gap: 1.25rem; }
+    .evolution { grid-template-columns: 1fr; gap: 0.25rem; text-align: center; }
+    .evo-arrow { transform: rotate(90deg); }
+    .decisions-grid { grid-template-columns: 1fr; }
+    .papers ul { grid-template-columns: 1fr; }
+    .card { padding: 1rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <header>
+    <h1>CellMem <span class="v3">v3</span> Techniques Inventory</h1>
+    <p class="subtitle">What we kept, what evolved, and what we dropped from v2</p>
+    <div class="stats">
+      <div class="stat stat-kept">
+        <span class="stat-number">6</span>
+        <span class="stat-label">Kept</span>
+      </div>
+      <div class="stat stat-evolved">
+        <span class="stat-number">5</span>
+        <span class="stat-label">Evolved</span>
+      </div>
+      <div class="stat stat-dropped">
+        <span class="stat-number">5</span>
+        <span class="stat-label">Dropped</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Design Decisions -->
+  <div class="design-decisions">
+    <h2>v3 Design Decisions</h2>
+    <div class="decisions-grid">
+      <div class="decision">
+        <span class="decision-key">Memory granularity</span>
+        <span class="decision-val">Hybrid (per-token K/V write, episode retrieval via router)</span>
+      </div>
+      <div class="decision">
+        <span class="decision-key">Layer placement</span>
+        <span class="decision-val">Configurable, default top-4</span>
+      </div>
+      <div class="decision">
+        <span class="decision-key">K/V storage</span>
+        <span class="decision-val">Per-layer pre-computed pre-RoPE (0.5 MB)</span>
+      </div>
+      <div class="decision">
+        <span class="decision-key">RoPE handling</span>
+        <span class="decision-val">Pre-RoPE (position-agnostic, "timeless post-it")</span>
+      </div>
+      <div class="decision">
+        <span class="decision-key">LoRA</span>
+        <span class="decision-val">Eliminated. Only router projectors W_Q^R, W_K^R</span>
+      </div>
+      <div class="decision">
+        <span class="decision-key">Router training</span>
+        <span class="decision-val">Contrastive InfoNCE loss, two-phase (MSA-style)</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- KEPT -->
+  <div class="section section-kept">
+    <div class="section-header">
+      <div class="section-dot"></div>
+      <h2>Kept</h2>
+      <span class="section-count">6 techniques unchanged from v2</span>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Surprise-gated writes (BTSP)</span>
+        <span class="badge badge-paper">Paper</span>
+      </div>
+      <div class="card-desc">Write only surprising tokens. Anti-Hebbian pure.</div>
+      <div class="card-source"><strong>Source:</strong> NIMH/Scripps 2025, Bhatt et al. &mdash; BTSP anti-Hebbian plasticity in CA1</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">SurpriseCalculator</span>
+        <span class="badge badge-paper">Paper</span>
+      </div>
+      <div class="card-desc">Per-token cross-entropy. Catches "confident but wrong".</div>
+      <div class="card-source"><strong>Source:</strong> NIMH/Scripps 2025 &mdash; Prediction error as write signal</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Decay on load</span>
+        <span class="badge badge-original">Original</span>
+      </div>
+      <div class="card-desc"><code>vectors *= decay_factor</code> on cross-session load. Natural forgetting.</div>
+      <div class="card-source"><strong>Source:</strong> Original CellMem &mdash; Inspired by memory consolidation during sleep</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Snapshot + rollback</span>
+        <span class="badge badge-original">Original</span>
+      </div>
+      <div class="card-desc">Periodic backups for recovery.</div>
+      <div class="card-source"><strong>Source:</strong> Original CellMem &mdash; Pragmatic engineering</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Decorrelation gate</span>
+        <span class="badge badge-neuroscience">Neuroscience</span>
+      </div>
+      <div class="card-desc"><code>min_novelty</code>: skip write if too similar to existing memories. Pattern separation.</div>
+      <div class="card-source"><strong>Source:</strong> Neuroscience &mdash; Dentate Gyrus pattern separation in hippocampus</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Delta writes</span>
+        <span class="badge badge-paper">Paper</span>
+      </div>
+      <div class="card-desc">Write prediction error instead of raw vector. Configurable <code>write_mode="delta"</code>.</div>
+      <div class="card-source"><strong>Source:</strong> Infini-attention, Munkhdalai et al. 2024 (arXiv:2404.07143) &mdash; Delta update rule</div>
+    </div>
+  </div>
+
+  <!-- EVOLVED -->
+  <div class="section section-evolved">
+    <div class="section-header">
+      <div class="section-dot"></div>
+      <h2>Evolved</h2>
+      <span class="section-count">5 techniques &mdash; same principle, different form</span>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">MemoryStore</span>
+        <span class="badge badge-paper">Paper</span>
+      </div>
+      <div class="card-desc">Storage format redesigned for native K/V with per-layer granularity.</div>
+      <div class="evolution">
+        <div>
+          <div class="evo-label">v2</div>
+          <div class="evo-old">hidden states <code>[K, d_model]</code></div>
+        </div>
+        <div class="evo-arrow">&rarr;</div>
+        <div>
+          <div class="evo-label">v3</div>
+          <div class="evo-new">K/V per-layer <code>[L, N, d_head]</code> pre-RoPE</div>
+        </div>
+      </div>
+      <div class="card-source"><strong>Source:</strong> MSA (arXiv:2603.23516) &mdash; K/V storage with mean pooling</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Two-phase training</span>
+        <span class="badge badge-paper">Paper</span>
+      </div>
+      <div class="card-desc">Training schedule evolved from gate freezing to loss-weighting warmup.</div>
+      <div class="evolution">
+        <div>
+          <div class="evo-label">v2</div>
+          <div class="evo-old">Phase 1 gate frozen (LoRA learns), Phase 2 gate unfrozen + BCE</div>
+        </div>
+        <div class="evo-arrow">&rarr;</div>
+        <div>
+          <div class="evo-label">v3</div>
+          <div class="evo-new">Phase 1 warmup <code>0.1*L_LM + L_contrastive</code>, Phase 2 main <code>L_LM + 0.1*L_contrastive</code></div>
+        </div>
+      </div>
+      <div class="card-source"><strong>Source:</strong> MSA &mdash; Warmup + main phase training schedule</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Auxiliary loss</span>
+        <div style="display:flex; gap:0.4rem;">
+          <span class="badge badge-paper">Paper</span>
+          <span class="badge badge-paper">Paper</span>
+        </div>
+      </div>
+      <div class="card-desc">Moved from scalar BCE to contrastive InfoNCE in embedding space.</div>
+      <div class="evolution">
+        <div>
+          <div class="evo-label">v2</div>
+          <div class="evo-old"><code>BCE(gate, 0.9/0.1)</code> on scalar</div>
+        </div>
+        <div class="evo-arrow">&rarr;</div>
+        <div>
+          <div class="evo-label">v3</div>
+          <div class="evo-new"><code>InfoNCE(Q^R, K^R)</code> contrastive in embedding space</div>
+        </div>
+      </div>
+      <div class="card-source"><strong>Source:</strong> MSA (InfoNCE routing loss) + LeWorldModel (arXiv:2603.19312, "don't rely on task loss alone")</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Init &ne; zero</span>
+        <span class="badge badge-original">Original</span>
+      </div>
+      <div class="card-desc">Non-zero initialization preserved; adapted from LoRA matrices to router projectors.</div>
+      <div class="evolution">
+        <div>
+          <div class="evo-label">v2</div>
+          <div class="evo-old"><code>lora_B ~ N(0, 1e-3)</code></div>
+        </div>
+        <div class="evo-arrow">&rarr;</div>
+        <div>
+          <div class="evo-label">v3</div>
+          <div class="evo-new"><code>W_Q^R, W_K^R ~ N(0, 0.02)</code></div>
+        </div>
+      </div>
+      <div class="card-source"><strong>Source:</strong> Original CellMem lesson from v2 &mdash; Zero-init blocks gradient via chain rule</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Max vector norm</span>
+        <span class="badge badge-original">Original</span>
+      </div>
+      <div class="card-desc">Norm clamping to validate; smaller norms expected with K/V.</div>
+      <div class="evolution">
+        <div>
+          <div class="evo-label">v2</div>
+          <div class="evo-old">Clamp norm on hidden states</div>
+        </div>
+        <div class="evo-arrow">&rarr;</div>
+        <div>
+          <div class="evo-label">v3</div>
+          <div class="evo-new">To validate on K/V (smaller norms expected)</div>
+        </div>
+      </div>
+      <div class="card-source"><strong>Source:</strong> Original CellMem &mdash; Explosion prevention</div>
+    </div>
+  </div>
+
+  <!-- DROPPED -->
+  <div class="section section-dropped">
+    <div class="section-header">
+      <div class="section-dot"></div>
+      <h2>Dropped</h2>
+      <span class="section-count">5 techniques no longer needed</span>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">ContentGate (CA1 tonic+phasic)</span>
+        <span class="badge badge-paper">Paper</span>
+      </div>
+      <div class="card-desc">Scalar gate <code>sigmoid(base + MLP(...))</code> &mdash; replaced by router top-k.</div>
+      <div class="card-source"><strong>Was from:</strong> NIMH/Scripps &mdash; CA1 principle remains in surprise writes, not in gate</div>
+      <div class="drop-reason"><strong>Reason:</strong> Gradient diluted through 18 layers, collapsed to 0.1, impossible to discriminate pos/neg</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Pupil range [0.1, 0.9]</span>
+        <span class="badge badge-original">Original</span>
+      </div>
+      <div class="card-desc"><code>0.1 + 0.8 * sigmoid(x)</code> &mdash; no more sigmoid.</div>
+      <div class="card-source"><strong>Was from:</strong> Original CellMem &mdash; Pupil metaphor</div>
+      <div class="drop-reason"><strong>Reason:</strong> Router doesn't use sigmoid, uses cosine similarity + discrete top-k</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Canal lock clamp</span>
+        <span class="badge badge-original">Original</span>
+      </div>
+      <div class="card-desc"><code>base.data.clamp_(-2, 2)</code> &mdash; no more scalar_base.</div>
+      <div class="card-source"><strong>Was from:</strong> Original CellMem &mdash; Lock metaphor</div>
+      <div class="drop-reason"><strong>Reason:</strong> Router has no scalar parameter to clamp</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">LoRA (q_proj, v_proj)</span>
+        <span class="badge badge-paper">Paper</span>
+      </div>
+      <div class="card-desc">K/V pre-RoPE are already native format &mdash; no adapter needed.</div>
+      <div class="card-source"><strong>Was from:</strong> Hu et al. 2021 &mdash; LoRA paper</div>
+      <div class="drop-reason"><strong>Reason:</strong> No need to adapt backbone, K/V already speak its language</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">MemoryRMSNorm</span>
+        <span class="badge badge-original">Original</span>
+      </div>
+      <div class="card-desc">K/V already normalized by backbone layer norm.</div>
+      <div class="card-source"><strong>Was from:</strong> Original CellMem</div>
+      <div class="drop-reason"><strong>Reason:</strong> Protection for noisy hidden states. K/V are clean</div>
+    </div>
+  </div>
+
+  <!-- Papers cited -->
+  <div class="papers">
+    <h2>Papers Cited</h2>
+    <ul>
+      <li><strong>NIMH/Scripps 2025</strong> &mdash; Bhatt et al., BTSP anti-Hebbian plasticity</li>
+      <li><strong>Infini-attention</strong> &mdash; Munkhdalai et al. 2024 <code>arXiv:2404.07143</code></li>
+      <li><strong>MSA</strong> &mdash; Memory Sparse Attention <code>arXiv:2603.23516</code></li>
+      <li><strong>LeWorldModel</strong> <code>arXiv:2603.19312</code></li>
+      <li><strong>Video Reasoning</strong> <code>arXiv:2603.16870</code></li>
+      <li><strong>LoRA</strong> &mdash; Hu et al. 2021</li>
+    </ul>
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    CellMem v3 &mdash; Techniques Inventory &bull; Last updated: 2026-03-27
+  </footer>
+
+</div>
+
+</body>
+</html>
