@@ -278,3 +278,44 @@ class TestMemoryStoreV3Persistence:
         store2 = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
         store2.load(path)
         assert torch.allclose(store2.keys[:, 0], torch.ones(1, 1, 4) * 0.5)
+
+
+class TestIntegrationSmoke:
+    """Integration tests requiring a model. Skip if model not available."""
+
+    @pytest.fixture
+    def wrapper(self):
+        """Load smallest Qwen model for testing."""
+        try:
+            from scripts.train_cellmem_qwen_v3 import CellMemWrapper
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            model_name = "Qwen/Qwen2.5-0.5B"
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = model.to(device)
+            n_layers = model.config.num_hidden_layers
+            layer_indices = list(range(n_layers - 2, n_layers))
+            return CellMemWrapper(model, tokenizer, layer_indices, device=device)
+        except Exception:
+            pytest.skip("Model not available")
+
+    def test_write_then_read_no_crash(self, wrapper):
+        wrapper.write_memory("Dr. Elena Voss discovered Pyrothene in 2031")
+        tokens = wrapper.tokenizer("What did Dr. Voss discover?", return_tensors="pt")
+        tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
+        wrapper._install_read_hooks()
+        with torch.no_grad():
+            output = wrapper.base_model(**tokens)
+        wrapper._remove_read_hooks()
+        assert output.logits is not None
+
+    def test_empty_memory_no_change(self, wrapper):
+        tokens = wrapper.tokenizer("Hello world", return_tensors="pt")
+        tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
+        with torch.no_grad():
+            out1 = wrapper.base_model(**tokens).logits.clone()
+        # Empty memory → no hooks installed → output identical
+        with torch.no_grad():
+            out2 = wrapper.base_model(**tokens).logits
+        assert torch.allclose(out1, out2, atol=1e-5)
