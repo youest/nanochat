@@ -58,7 +58,7 @@ Metadata:
   write_ptr, active_count
 ```
 
-Storage: ~0.5 MB for 256 tokens × 4 layers (vs 1.3 MB in v2 for hidden states).
+Storage: ~2 MB for 256 tokens × 4 layers × K+V × n_kv_heads (vs 1.3 MB in v2 for 256 hidden states at d_model=2560). V3 uses more storage for higher fidelity — the tradeoff is precision, not compression.
 
 ## Key Design Decisions
 
@@ -110,7 +110,7 @@ Extended from v2 with new fields:
 ```python
 # New in v3
 router_dim: int = 128           # dimension of router embedding space
-router_layers: str = "top4"     # "top3" | "top4" | "top8" | "top_half"
+router_layers: list[int] | None = None  # None = auto top-4; e.g. [32,33,34,35]
 episode_size: int = 8           # tokens per episode for router keys
 top_k: int = 4                  # episodes to retrieve
 contrastive_tau: float = 0.07   # InfoNCE temperature
@@ -123,7 +123,16 @@ W_Q_R: Linear(d_model, d_router)  # query projector
 W_K_R: Linear(d_model, d_router)  # key projector
 
 route(h_query, router_keys) → top_k_indices, scores
+  # Returns min(top_k, n_available_episodes) indices.
+  # Returns empty if memory is empty.
+
 encode_episode(h_tokens) → router_key [d_router]
+  # Input: hidden states (pre-attention) at the first router layer,
+  # mean-pooled over episode_size tokens, projected through W_K_R.
+  # Uses hidden states (not K/V) because at read time h_query is also
+  # a hidden state — the spaces must match.
+  # Partial episodes (< episode_size tokens) are mean-pooled as-is.
+
 contrastive_loss(q, positive, negatives) → InfoNCE scalar
 ```
 
@@ -185,7 +194,9 @@ L_aux = -log(exp(cos(Q^R, K^R_positive) / τ) / Σ_i exp(cos(Q^R, K^R_i) / τ))
 - Loss: `1.0 * L_LM + 0.1 * L_contrastive`
 - Trainable: router W_Q^R, W_K^R (fine-tune)
 - Backbone: frozen
-- Goal: model generates correct answer using retrieved K/V
+- Goal: verify the model generates correct answers using retrieved K/V
+
+**Note on gradient flow in Phase 2:** Top-k episode selection is non-differentiable (hard selection), so L_LM gradient cannot reach the router through the read path. L_LM serves as a validation signal: if the router (trained by L_contrastive) selects the right episodes, L_LM should be low. L_contrastive continues to refine the router in Phase 2. The read path attention has zero trainable parameters — it uses the backbone's frozen W_Q, W_K, W_V, o_proj on K/V pairs that the backbone itself produced. Correctness depends entirely on the router selecting the right episodes.
 
 ### Training Data
 
@@ -200,7 +211,7 @@ Same synthetic data as v2 (fictional facts + queries). Structure per example:
 }
 ```
 
-Negatives come from batch (other examples' episodes), no explicit negative pairs needed.
+Negatives come from batch: all B examples' memory episodes are pooled into a shared set. For each query, its own episode is the positive; all other examples' episodes are negatives (CLIP-style cross-batch). This requires a shared memory store during training batches.
 
 ## Techniques Inventory
 
@@ -253,13 +264,21 @@ Negatives come from batch (other examples' episodes), no explicit negative pairs
 | **Baseline Preservation** (ΔPPL) | < 0.5 | — |
 | **Router Discrimination** (pos-neg gap) | ≥ 0.3 | ~0 (gate couldn't discriminate) |
 
-**First checkpoint:** router discrimination. If the router doesn't discriminate pos/neg (gap < 0.1), stop and investigate. Unlike v2's scalar gate, InfoNCE has rich gradient in embedding space — this should work.
+**First checkpoint:** router discrimination after Phase 1 (epoch 20). If the router doesn't discriminate pos/neg (gap < 0.1), stop and investigate. Unlike v2's scalar gate, InfoNCE has rich gradient in embedding space — this should work.
+
+### Edge Cases
+
+- **Empty memory**: read path returns unchanged hidden_states (no attention). Router.route() returns empty indices.
+- **Partial episodes**: if fewer than episode_size tokens are written, encode_episode() mean-pools over available tokens.
+- **top_k > available episodes**: route() returns min(top_k, n_available_episodes).
+- **Memory full**: overwrite slot with lowest surprise (same as v2).
 
 ## File Map
 
 | File | Contents | Notes |
 |---|---|---|
-| `nanochat/cellmem_v3.py` | CellMemConfig, MemoryStore, SurpriseCalculator, MemoryRouter | Core module, no HF dependency |
+| `nanochat/cellmem_v3.py` | CellMemConfig, MemoryStore, MemoryRouter | Core module, no HF dependency |
+| `nanochat/cellmem_v2.py` | SurpriseCalculator (imported, not duplicated) | Unchanged from v2 |
 | `nanochat/kv_interceptor.py` | KVInterceptor | Hook-based K/V capture, Qwen-specific |
 | `scripts/train_cellmem_qwen.py` | CellMemWrapper, training loop, eval | Rewritten for v3 |
 | `tests/test_cellmem_v3.py` | Unit tests for all components | New file |
