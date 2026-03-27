@@ -1,0 +1,141 @@
+# SkyPilot managed spot job for CellMem v3 training.
+#
+# Trains MemoryRouter (W_Q^R, W_K^R) on Qwen3-4B via two-phase InfoNCE schedule.
+# Backbone always frozen — only ~656K router params are trained.
+#
+# Usage:
+#   sky jobs launch runs/spot_train_v3.yaml
+#   sky jobs launch runs/spot_train_v3.yaml --env EPOCHS1=5 --env EPOCHS2=5   # quick smoke
+#   sky jobs queue
+#   sky jobs logs
+#
+# Spec: docs/cellmem-v3/2026-03-27-cellmem-v3-design.md
+# Success metrics:
+#   Router Recall@4 >= 80%
+#   Discrimination gap >= 0.3
+#   Generation Recall >= 75%
+
+resources:
+  use_spot: true
+  any_of:
+    - accelerators: A100:1
+      region: us-east-1
+    - accelerators: A100:1
+      region: us-west-2
+    - accelerators: A100:1
+      region: eu-south-1
+    - accelerators: L4:1
+      region: us-east-1
+    - accelerators: L4:1
+      region: us-west-2
+
+file_mounts:
+  /checkpoints:
+    source: s3://nanoy-checks-youest/
+    mode: MOUNT
+
+envs:
+  S3_BUCKET: "s3://nanoy-checks-youest"
+  S3_REGION: "eu-south-1"
+  MODEL: "Qwen/Qwen3-4B"
+  EPOCHS1: "20"
+  EPOCHS2: "30"
+  BATCH_SIZE: "8"
+  LR: "1e-3"
+  N_TRAIN: "256"
+
+setup: |
+  git clone https://github.com/youest/nanochat.git ~/nanochat 2>/dev/null || \
+    (cd ~/nanochat && git fetch && git checkout cellmem/v2 && git pull)
+  cd ~/nanochat && git checkout cellmem/v2
+
+  command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  cd ~/nanochat
+  [ -d ".venv" ] || uv venv
+  uv sync --extra gpu
+
+  # Fix CUDA on NVSwitch instances (p4d, p5)
+  DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+  DRIVER_MAJOR=${DRIVER_VER%%.*}
+  if ! systemctl is-active --quiet nvidia-fabricmanager 2>/dev/null; then
+    sudo apt-get update -qq
+    sudo apt-get install -y --allow-downgrades nvidia-fabricmanager-${DRIVER_MAJOR}=${DRIVER_VER}-1 2>/dev/null || \
+      sudo apt-get install -y nvidia-fabricmanager-${DRIVER_MAJOR} 2>/dev/null || true
+    sudo systemctl start nvidia-fabricmanager 2>/dev/null || true
+  fi
+
+  # Downgrade to cu126 if CUDA not available (driver 535 on p4d)
+  source .venv/bin/activate
+  python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
+    echo "Reinstalling torch for cu126..."
+    uv pip install --reinstall torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
+  }
+
+  # Pre-download Qwen3-4B model to HF cache
+  source .venv/bin/activate
+  python -c "
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+print('Downloading $MODEL...')
+AutoTokenizer.from_pretrained('$MODEL')
+AutoModelForCausalLM.from_pretrained('$MODEL', dtype=torch.bfloat16)
+print('Model ready.')
+"
+
+run: |
+  set -e
+  cd ~/nanochat
+  source .venv/bin/activate
+  export OMP_NUM_THREADS=1
+  export PYTHONPATH=~/nanochat
+
+  python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'CUDA OK: {torch.cuda.get_device_name(0)}')"
+
+  S3_CKPT_DIR="$S3_BUCKET/cellmem_v3"
+
+  # Restore router checkpoint if resuming
+  CKPT_PATH=/checkpoints/cellmem_v3/router_latest.pt
+  RESUME_FLAG=""
+  if [ -f "$CKPT_PATH" ]; then
+    echo "Found router checkpoint at $CKPT_PATH — will resume Phase 2"
+    RESUME_FLAG="--resume-phase2 $CKPT_PATH"
+  fi
+
+  # Background sync of router checkpoints to S3
+  sync_to_s3() {
+    while true; do
+      sleep 120
+      aws s3 sync /tmp/cellmem_v3_ckpt/ "$S3_CKPT_DIR/" \
+        --region "$S3_REGION" 2>/dev/null || true
+    done
+  }
+  sync_to_s3 &
+  SYNC_PID=$!
+  trap "kill $SYNC_PID 2>/dev/null; aws s3 sync /tmp/cellmem_v3_ckpt/ '$S3_CKPT_DIR/' --region '$S3_REGION' 2>/dev/null || true" EXIT
+
+  mkdir -p /tmp/cellmem_v3_ckpt
+
+  echo "=== CellMem v3 Training ==="
+  echo "Model: $MODEL | Epochs: Phase1=$EPOCHS1 Phase2=$EPOCHS2 | N_train=$N_TRAIN"
+
+  python scripts/train_cellmem_qwen_v3.py \
+    --model "$MODEL" \
+    --epochs1 "$EPOCHS1" \
+    --epochs2 "$EPOCHS2" \
+    --batch-size "$BATCH_SIZE" \
+    --lr "$LR" \
+    --n-train "$N_TRAIN" \
+    --device cuda \
+    --checkpoint-dir /tmp/cellmem_v3_ckpt \
+    $RESUME_FLAG \
+    2>&1 | tee /tmp/cellmem_v3_train.log
+
+  # Final sync
+  aws s3 sync /tmp/cellmem_v3_ckpt/ "$S3_CKPT_DIR/" --region "$S3_REGION" || true
+  aws s3 cp /tmp/cellmem_v3_train.log "$S3_CKPT_DIR/train.log" --region "$S3_REGION" || true
+
+  echo "========================================"
+  echo "DONE. Checkpoints at: $S3_CKPT_DIR"
+  echo "Retrieve: aws s3 sync $S3_CKPT_DIR/ ~/.cache/nanochat/cellmem_v3/"
+  echo "========================================"

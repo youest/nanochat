@@ -483,15 +483,18 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--n-train", type=int, default=64)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--checkpoint-dir", default=None,
+                        help="Directory to save router checkpoints after each phase")
+    parser.add_argument("--resume-phase2", default=None, metavar="CKPT",
+                        help="Skip Phase 1 and load router checkpoint, then run Phase 2")
     args = parser.parse_args()
 
     print(f"Loading {args.model} on {args.device}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
     model = model.to(args.device)
 
     n_layers = model.config.num_hidden_layers
-    # Default: top-4 layers
     layer_indices = list(range(n_layers - 4, n_layers))
     print(f"Router layers: {layer_indices}")
 
@@ -502,20 +505,36 @@ def main():
     )
     wrapper = CellMemWrapper(model, tokenizer, layer_indices, config=config, device=args.device)
 
+    ckpt_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else None
+    if ckpt_dir:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
     train_data = generate_training_data(args.n_train)
     eval_data = generate_training_data(20)
 
-    # Phase 1: warmup router
-    print("\n=== Phase 1: Router warmup ===")
-    train_phase(wrapper, train_data, n_epochs=args.epochs1,
-                lm_weight=0.1, contrastive_weight=1.0,
-                lr=args.lr, batch_size=args.batch_size, phase_name="p1")
+    if args.resume_phase2:
+        print(f"\n=== Resuming: loading router from {args.resume_phase2} ===")
+        state = torch.load(args.resume_phase2, map_location=args.device, weights_only=True)
+        wrapper.router.load_state_dict(state)
+    else:
+        # Phase 1: warmup router
+        print("\n=== Phase 1: Router warmup ===")
+        train_phase(wrapper, train_data, n_epochs=args.epochs1,
+                    lm_weight=0.1, contrastive_weight=1.0,
+                    lr=args.lr, batch_size=args.batch_size, phase_name="p1")
 
-    metrics = eval_router(wrapper, eval_data)
-    print(f"\nPhase 1 eval: router_recall@{config.top_k}={metrics['recall_at_k']:.2%}, "
-          f"discrimination_gap={metrics['discrimination_gap']:.3f}")
-    if metrics["discrimination_gap"] < 0.1:
-        print("WARNING: Router not discriminating (gap < 0.1). Check training.")
+        metrics = eval_router(wrapper, eval_data)
+        print(f"\nPhase 1 eval: router_recall@{config.top_k}={metrics['recall_at_k']:.2%}, "
+              f"discrimination_gap={metrics['discrimination_gap']:.3f}")
+        if metrics["discrimination_gap"] < 0.1:
+            print("WARNING: Router not discriminating (gap < 0.1). Check training.")
+
+        if ckpt_dir:
+            p1_path = ckpt_dir / "router_phase1.pt"
+            torch.save(wrapper.router.state_dict(), p1_path)
+            # Also save as latest for preemption recovery
+            torch.save(wrapper.router.state_dict(), ckpt_dir / "router_latest.pt")
+            print(f"Router checkpoint saved: {p1_path}")
 
     # Phase 2: generation validation
     print("\n=== Phase 2: Generation ===")
@@ -529,6 +548,12 @@ def main():
     print(f"  router_recall@{config.top_k}={metrics_final['recall_at_k']:.2%} (target >=80%)")
     print(f"  discrimination_gap={metrics_final['discrimination_gap']:.3f} (target >=0.3)")
     print(f"  generation_recall={gen_metrics['generation_recall']:.2%} (target >=75%)")
+
+    if ckpt_dir:
+        final_path = ckpt_dir / "router_final.pt"
+        torch.save(wrapper.router.state_dict(), final_path)
+        torch.save(wrapper.router.state_dict(), ckpt_dir / "router_latest.pt")
+        print(f"Final router checkpoint saved: {final_path}")
 
 
 if __name__ == "__main__":
