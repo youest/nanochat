@@ -1,0 +1,76 @@
+# nanochat/kv_interceptor.py
+"""
+KVInterceptor: Hook-based capture of K/V pairs pre-RoPE.
+
+Model-specific. Currently supports Qwen architecture.
+Registers forward hooks on attention layers to intercept K/V
+before rotary position embeddings are applied.
+"""
+import torch
+import torch.nn as nn
+
+
+class KVInterceptor:
+    """Captures K/V projections pre-RoPE from specified layers.
+
+    Uses forward hooks on the attention module's k_proj and v_proj
+    to capture K/V before RoPE rotation is applied.
+    """
+    def __init__(self, model: nn.Module, layer_indices: list,
+                 model_type: str = "qwen"):
+        self.layer_indices = layer_indices
+        self.model_type = model_type
+        self._buffer: dict = {}
+        self._hooks: list = []
+        self._register_hooks(model)
+
+    def _get_layer(self, model: nn.Module, layer_idx: int) -> nn.Module:
+        """Get the transformer layer. Qwen: model.model.layers[i]"""
+        return model.model.layers[layer_idx]
+
+    def _get_attention_module(self, model: nn.Module, layer_idx: int) -> nn.Module:
+        """Get the attention module for a layer. Qwen: model.model.layers[i].self_attn"""
+        return model.model.layers[layer_idx].self_attn
+
+    def _register_hooks(self, model: nn.Module):
+        """Register hooks on transformer layers to capture K/V pre-RoPE.
+
+        Hooks fire on the layer forward pass and compute k_proj/v_proj
+        on the input hidden states to capture K/V before RoPE rotation.
+        """
+        for layer_idx in self.layer_indices:
+            layer = self._get_layer(model, layer_idx)
+            attn = self._get_attention_module(model, layer_idx)
+
+            def make_layer_hook(l_idx, attn_module):
+                def hook(module, input, output):
+                    # input[0] is the hidden states tensor
+                    hidden = input[0]
+                    with torch.no_grad():
+                        k = attn_module.k_proj(hidden).detach()
+                        v = attn_module.v_proj(hidden).detach()
+                    self._buffer[l_idx] = [k, v]
+                return hook
+
+            h = layer.register_forward_hook(make_layer_hook(layer_idx, attn))
+            self._hooks.append(h)
+
+    def get_buffered_kv(self) -> dict:
+        """Return captured K/V pairs. {layer_idx: (K, V)}."""
+        result = {}
+        for l_idx, kv in self._buffer.items():
+            k, v = kv
+            if k is not None and v is not None:
+                result[l_idx] = (k, v)
+        return result
+
+    def clear_buffer(self):
+        """Clear the capture buffer."""
+        self._buffer.clear()
+
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+        self._buffer.clear()
