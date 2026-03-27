@@ -176,7 +176,7 @@ class CellMemWrapper:
 
                     # Scaled dot-product attention (no RoPE on memory K/V)
                     attn_out = F.scaled_dot_product_attention(q, k_m, v_m)  # [B, n_heads, T, d_head]
-                    attn_out = attn_out.transpose(1, 2).reshape(B, T, D)  # [B, T, D]
+                    attn_out = attn_out.transpose(1, 2).reshape(B, T, n_heads * d_head)  # [B, T, n_heads*d_head]
                     attn_out = module.o_proj(attn_out)  # [B, T, D]
 
                     # Residual update
