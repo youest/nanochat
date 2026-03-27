@@ -77,6 +77,7 @@ class CellMemWrapper:
         # Use actual k_proj output to get d_head (Qwen3 has head_dim != hidden_size/n_heads)
         k_proj = model.model.layers[0].self_attn.k_proj
         d_head = k_proj.out_features // n_kv_heads
+        self._d_head = d_head  # store for clear_memory()
 
         self.config = config or CellMemConfig(
             router_layers=layer_indices,
@@ -267,9 +268,7 @@ class CellMemWrapper:
         """Reset memory store."""
         cfg = self.config
         n_kv = self.base_model.config.num_key_value_heads
-        d_head = (self.base_model.config.hidden_size //
-                  self.base_model.config.num_attention_heads)
-        self.store = MemoryStore(cfg, len(self.layer_indices), n_kv, d_head)
+        self.store = MemoryStore(cfg, len(self.layer_indices), n_kv, self._d_head)
         self._episode_buffer = []
         self._episode_token_count = 0
 
