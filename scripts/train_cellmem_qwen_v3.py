@@ -119,8 +119,11 @@ class CellMemWrapper:
 
             def make_hook(lpos):
                 def hook(module, args, kwargs):
-                    # args[0] is hidden_states in most HF Qwen implementations
-                    if isinstance(args, tuple) and len(args) > 0:
+                    # Qwen calls attention with keyword args; hidden_states may be in kwargs or args
+                    h_in_kwargs = 'hidden_states' in kwargs
+                    if h_in_kwargs:
+                        h = kwargs['hidden_states']
+                    elif isinstance(args, tuple) and len(args) > 0:
                         h = args[0]
                     else:
                         return args, kwargs
@@ -130,7 +133,8 @@ class CellMemWrapper:
                         return args, kwargs
 
                     router_keys = router_keys.to(self.device)
-                    indices, scores = self.router.route(h, router_keys)
+                    router_dtype = next(self.router.parameters()).dtype
+                    indices, scores = self.router.route(h.to(router_dtype), router_keys)
                     if indices.shape[-1] == 0:
                         return args, kwargs
 
@@ -150,7 +154,7 @@ class CellMemWrapper:
 
                     n_heads = self.base_model.config.num_attention_heads
                     n_kv_heads_cfg = self.base_model.config.num_key_value_heads
-                    d_head = D // n_heads
+                    d_head = self._d_head  # use actual d_head from k_proj (correct for GQA)
 
                     # Reshape Q for multi-head attention
                     q = q.view(B, T, n_heads, d_head).transpose(1, 2)  # [B, n_heads, T, d_head]
@@ -177,7 +181,13 @@ class CellMemWrapper:
 
                     # Residual update
                     new_h = h + attn_out
-                    return (new_h,) + args[1:], kwargs
+
+                    # Return modified hidden_states in correct position
+                    if h_in_kwargs:
+                        kwargs['hidden_states'] = new_h
+                        return args, kwargs
+                    else:
+                        return (new_h,) + args[1:], kwargs
 
                 return hook
 
@@ -358,8 +368,14 @@ def compute_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tensor:
 
 
 def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
-    """Evaluate router recall and discrimination gap."""
+    """Evaluate router recall and discrimination gap.
+
+    Only items where routing was possible (active_episodes > 0) are counted
+    in the recall denominator. Items with no episodes are silently skipped.
+    """
     recall_hits = 0
+    routable_count = 0
+    skipped_count = 0
     pos_scores = []
     neg_scores = []
 
@@ -369,8 +385,10 @@ def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
 
         router_keys = wrapper.store.get_router_keys()
         if router_keys.shape[0] == 0:
+            skipped_count += 1
             continue
 
+        routable_count += 1
         q_inputs = wrapper.tokenizer(item["query"], return_tensors="pt").to(wrapper.device)
         with torch.no_grad():
             q_out = wrapper.base_model(**q_inputs, output_hidden_states=True)
@@ -393,12 +411,14 @@ def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
         if n_eps > 1:
             neg_scores.extend(sims[1:].tolist())
 
-    n = max(len(data[:50]), 1)
+    print(f"  [eval_router] routable={routable_count}, skipped(no episode)={skipped_count}")
+    n = max(routable_count, 1)
     gap = (sum(pos_scores) / max(len(pos_scores), 1) -
            sum(neg_scores) / max(len(neg_scores), 1))
     return {
         "recall_at_k": recall_hits / n,
         "discrimination_gap": gap,
+        "routable_fraction": routable_count / max(routable_count + skipped_count, 1),
     }
 
 

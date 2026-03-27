@@ -319,3 +319,36 @@ class TestIntegrationSmoke:
         with torch.no_grad():
             out2 = wrapper.base_model(**tokens).logits
         assert torch.allclose(out1, out2, atol=1e-5)
+
+    def test_memory_injection_changes_logits(self, wrapper):
+        """Memory injection via read hooks must visibly change logits.
+
+        Verifies that _install_read_hooks() actually modifies the residual
+        stream: logits with memory should differ from logits without memory.
+        """
+        wrapper.clear_memory()
+        wrapper.write_memory("Dr. Elena Voss discovered Pyrothene in 2031")
+        assert wrapper.store.active_episodes > 0, (
+            "No episodes stored — surprise threshold too high or text too short"
+        )
+
+        tokens = wrapper.tokenizer("What did Dr. Voss discover?", return_tensors="pt")
+        tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
+
+        # Forward without memory hooks
+        with torch.no_grad():
+            out_no_mem = wrapper.base_model(**tokens).logits.clone()
+
+        # Forward with memory hooks injecting stored KV
+        wrapper._install_read_hooks()
+        try:
+            with torch.no_grad():
+                out_with_mem = wrapper.base_model(**tokens).logits
+        finally:
+            wrapper._remove_read_hooks()
+
+        diff = (out_no_mem - out_with_mem).abs().max().item()
+        assert diff > 1e-5, (
+            f"Memory injection had no effect on logits (max diff={diff:.2e}). "
+            "Read hooks are not modifying the residual stream."
+        )
