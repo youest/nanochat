@@ -76,14 +76,7 @@ setup: |
 
   # Pre-download Qwen3-4B model to HF cache
   source .venv/bin/activate
-  python -c "
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
-print('Downloading $MODEL...')
-AutoTokenizer.from_pretrained('$MODEL')
-AutoModelForCausalLM.from_pretrained('$MODEL', dtype=torch.bfloat16)
-print('Model ready.')
-"
+  python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; import torch; AutoTokenizer.from_pretrained('$MODEL'); AutoModelForCausalLM.from_pretrained('$MODEL', dtype=torch.bfloat16); print('Model ready.')"
 
 run: |
   set -e
