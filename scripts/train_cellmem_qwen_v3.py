@@ -74,7 +74,9 @@ class CellMemWrapper:
 
         d_model = model.config.hidden_size
         n_kv_heads = model.config.num_key_value_heads
-        d_head = d_model // model.config.num_attention_heads
+        # Use actual k_proj output to get d_head (Qwen3 has head_dim != hidden_size/n_heads)
+        k_proj = model.model.layers[0].self_attn.k_proj
+        d_head = k_proj.out_features // n_kv_heads
 
         self.config = config or CellMemConfig(
             router_layers=layer_indices,
