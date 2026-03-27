@@ -6,7 +6,7 @@ Two-phase training: router warmup (InfoNCE) then generation validation.
 Only router (W_Q^R, W_K^R) is trained. Backbone always frozen.
 
 Usage:
-    python scripts/train_cellmem_qwen_v3.py --model Qwen/Qwen2.5-0.5B --epochs1 20 --epochs2 30
+    python scripts/train_cellmem_qwen_v3.py --model Qwen/Qwen3-4B --epochs1 20 --epochs2 30
 """
 from __future__ import annotations
 import argparse
@@ -474,7 +474,7 @@ def train_phase(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--epochs1", type=int, default=20)
     parser.add_argument("--epochs2", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
