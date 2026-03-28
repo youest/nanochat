@@ -1,0 +1,71 @@
+# SkyPilot launch for CellMem v3 training on Vast.ai.
+# No S3 dependency — checkpoints saved locally on the instance.
+#
+# Usage:
+#   sky launch --infra vast --gpus L40S:1 -c cellmem-v3 runs/vast_train_v3.yaml
+#   sky logs cellmem-v3
+#   sky down cellmem-v3
+
+resources:
+  use_spot: true
+
+envs:
+  MODEL: "Qwen/Qwen3-4B"
+  EPOCHS1: "20"
+  EPOCHS2: "30"
+  BATCH_SIZE: "8"
+  LR: "1e-3"
+  N_TRAIN: "256"
+
+setup: |
+  git clone https://github.com/youest/nanochat.git ~/nanochat 2>/dev/null || \
+    (cd ~/nanochat && git remote set-url origin https://github.com/youest/nanochat.git && \
+     git fetch origin && git checkout cellmem/v2 && git pull origin cellmem/v2)
+  cd ~/nanochat && git remote set-url origin https://github.com/youest/nanochat.git && \
+    git fetch origin && git checkout cellmem/v2 && git pull origin cellmem/v2
+
+  command -v uv &>/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  cd ~/nanochat
+  [ -d ".venv" ] || uv venv
+  uv sync --extra gpu
+
+  source .venv/bin/activate
+  python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
+    echo "Reinstalling torch for cu126..."
+    uv pip install --reinstall torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
+  }
+
+  # Pre-download model
+  source .venv/bin/activate
+  python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; import torch; AutoTokenizer.from_pretrained('$MODEL'); AutoModelForCausalLM.from_pretrained('$MODEL', torch_dtype=torch.bfloat16); print('Model ready.')"
+
+run: |
+  set -e
+  cd ~/nanochat
+  source .venv/bin/activate
+  export OMP_NUM_THREADS=1
+  export PYTHONPATH=~/nanochat
+
+  python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'CUDA OK: {torch.cuda.get_device_name(0)}')"
+
+  mkdir -p /tmp/cellmem_v3_ckpt
+
+  echo "=== CellMem v3 Training ==="
+  echo "Model: $MODEL | Epochs: Phase1=$EPOCHS1 Phase2=$EPOCHS2 | N_train=$N_TRAIN"
+
+  python scripts/train_cellmem_qwen_v3.py \
+    --model "$MODEL" \
+    --epochs1 "$EPOCHS1" \
+    --epochs2 "$EPOCHS2" \
+    --batch-size "$BATCH_SIZE" \
+    --lr "$LR" \
+    --n-train "$N_TRAIN" \
+    --device cuda \
+    --checkpoint-dir /tmp/cellmem_v3_ckpt \
+    2>&1 | tee /tmp/cellmem_v3_train.log
+
+  echo "========================================"
+  echo "DONE. Checkpoints at: /tmp/cellmem_v3_ckpt"
+  echo "Retrieve with: sky rsync cellmem-v3 /tmp/cellmem_v3_ckpt/ ./cellmem_v3_ckpt/"
+  echo "========================================"
