@@ -8,6 +8,7 @@
 
 resources:
   use_spot: true
+  gpus: L40S:1
 
 envs:
   MODEL: "Qwen/Qwen3-4B"
