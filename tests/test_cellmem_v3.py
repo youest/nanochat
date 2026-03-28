@@ -41,7 +41,7 @@ class TestKVInterceptor:
                 self.self_attn = FakeAttn()
 
             def forward(self, x):
-                return x
+                return self.self_attn(x)  # must call self_attn so pre_hook fires
 
         class FakeModel(torch.nn.Module):
             def __init__(self):

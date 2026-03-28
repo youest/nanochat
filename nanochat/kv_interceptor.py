@@ -33,26 +33,39 @@ class KVInterceptor:
         return model.model.layers[layer_idx].self_attn
 
     def _register_hooks(self, model: nn.Module):
-        """Register hooks on transformer layers to capture K/V pre-RoPE.
+        """Register hooks on self_attn to capture K/V pre-RoPE.
 
-        Hooks fire on the layer forward pass and compute k_proj/v_proj
-        on the input hidden states to capture K/V before RoPE rotation.
+        Hooks fire on the self_attn forward pre-hook where the input is
+        the NORMED hidden state (post-input_layernorm). This is the same
+        input that q_proj/k_proj/v_proj use inside self_attn, so the
+        captured K/V are from the correct distribution.
+
+        Using layer.register_forward_hook (old approach) gave input[0] =
+        un-normed residual stream, causing Q (normed) @ K (un-normed)
+        dot products to be meaningless garbage.
         """
         for layer_idx in self.layer_indices:
-            layer = self._get_layer(model, layer_idx)
             attn = self._get_attention_module(model, layer_idx)
 
-            def make_layer_hook(l_idx, attn_module):
-                def hook(module, input, output):
-                    # input[0] is the hidden states tensor
-                    hidden = input[0]
+            def make_attn_hook(l_idx, attn_module):
+                def hook(module, args, kwargs):
+                    # self_attn pre_hook: args[0] or kwargs['hidden_states']
+                    # is the normed hidden state (post-input_layernorm, pre-RoPE)
+                    if 'hidden_states' in kwargs:
+                        hidden = kwargs['hidden_states']
+                    elif isinstance(args, tuple) and len(args) > 0:
+                        hidden = args[0]
+                    else:
+                        return
                     with torch.no_grad():
                         k = attn_module.k_proj(hidden).detach()
                         v = attn_module.v_proj(hidden).detach()
                     self._buffer[l_idx] = [k, v]
                 return hook
 
-            h = layer.register_forward_hook(make_layer_hook(layer_idx, attn))
+            h = attn.register_forward_pre_hook(
+                make_attn_hook(layer_idx, attn), with_kwargs=True
+            )
             self._hooks.append(h)
 
     def get_buffered_kv(self) -> dict:
