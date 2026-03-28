@@ -121,7 +121,7 @@ class CellMemWrapper:
         when injecting into the pre-hook input (pre-hook bug: α=1.0 into normed_h
         disrupted all downstream attention projections).
         """
-        ALPHA = 2.0  # post-hook is safe at higher alpha (backbone self_attn runs clean)
+        ALPHA = 1.0  # post-hook is safe at higher alpha (backbone self_attn runs clean)
         self._remove_read_hooks()
         for layer_pos, layer_idx in enumerate(self.layer_indices):
             attn = self.base_model.model.layers[layer_idx].self_attn
@@ -477,6 +477,7 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict], debug: bool = Fal
                 **q_inputs,
                 max_new_tokens=30,
                 do_sample=False,
+                repetition_penalty=1.3,
                 pad_token_id=wrapper.tokenizer.eos_token_id,
             )
 
