@@ -620,12 +620,37 @@ def main():
                 lr=args.lr * 0.3, batch_size=args.batch_size, phase_name="p2")
 
     metrics_final = eval_router(wrapper, eval_data)
+
+    # Text-prefix oracle: memory text prepended directly (bypasses K/V injection).
+    # If this gives high recall, the router+data is fine and only K/V injection needs fixing.
+    print("\n=== Text-prefix oracle (memory in context, no K/V injection) ===")
+    correct_oracle = 0
+    n_oracle = min(20, len(eval_data))
+    for item in eval_data[:n_oracle]:
+        full_text = f"{item['memory']}\n\nQuestion: {item['query']}\nAnswer:"
+        inputs = wrapper.tokenizer(full_text, return_tensors="pt").to(wrapper.device)
+        with torch.no_grad():
+            gen_ids = wrapper.base_model.generate(
+                **inputs, max_new_tokens=30, do_sample=False,
+                repetition_penalty=1.3, pad_token_id=wrapper.tokenizer.eos_token_id,
+            )
+        generated = wrapper.tokenizer.decode(
+            gen_ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        ).strip()
+        hit = item["answer"].lower() in generated.lower()
+        if hit:
+            correct_oracle += 1
+        print(f"  {'✓' if hit else '✗'} | expected={item['answer']!r} | got={generated[:50]!r}")
+    oracle_recall = correct_oracle / n_oracle
+    print(f"Oracle recall: {oracle_recall:.2%}")
+
     print("\n=== Generation debug (first 20 items) ===")
     gen_metrics = eval_generation(wrapper, eval_data, debug=True)
     print(f"\nFinal eval:")
     print(f"  router_recall@{config.top_k}={metrics_final['recall_at_k']:.2%} (target >=80%)")
     print(f"  discrimination_gap={metrics_final['discrimination_gap']:.3f} (target >=0.3)")
     print(f"  generation_recall={gen_metrics['generation_recall']:.2%} (target >=75%)")
+    print(f"  text_prefix_oracle={oracle_recall:.2%} (should be ~100% if data/eval OK)")
 
     if ckpt_dir:
         final_path = ckpt_dir / "router_final.pt"
