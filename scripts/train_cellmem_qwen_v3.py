@@ -361,8 +361,8 @@ def compute_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tensor:
         wrapper.clear_memory()
         wrapper.write_memory(item["memory"])
 
-        # Query + answer as target
-        full_text = item["query"] + " " + item["answer"]
+        # Query + answer as target (same Q&A format used in eval_generation)
+        full_text = f"Question: {item['query']}\nAnswer: {item['answer']}"
         inputs = wrapper.tokenizer(full_text, return_tensors="pt").to(wrapper.device)
         targets = inputs["input_ids"].clone()
         with maybe_autocast(wrapper.device):
@@ -435,32 +435,47 @@ def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
 
 
 def eval_generation(wrapper: CellMemWrapper, data: list[dict], debug: bool = False) -> dict:
-    """Evaluate generation recall: does model generate the correct answer?"""
+    """Evaluate generation recall: does model generate the correct answer?
+
+    Uses "Question: {query}\\nAnswer:" format for better base-model completion.
+    Logit delta is measured correctly: no_mem before write_memory (empty store →
+    hooks return early → no injection), with_mem after write_memory.
+    """
     wrapper._install_read_hooks()
     correct = 0
     n = min(20, len(data))  # quick eval
 
     for item in data[:n]:
         wrapper.clear_memory()
-        wrapper.write_memory(item["memory"])
 
-        has_memory = wrapper.store.active_episodes > 0
+        # Use Q&A format to elicit direct answers from base model
+        q_text = f"Question: {item['query']}\nAnswer:"
+        q_inputs = wrapper.tokenizer(q_text, return_tensors="pt").to(wrapper.device)
+        answer_tok = wrapper.tokenizer.encode(" " + item["answer"], add_special_tokens=False)
+        if not answer_tok:
+            answer_tok = wrapper.tokenizer.encode(item["answer"], add_special_tokens=False)
 
-        q_inputs = wrapper.tokenizer(item["query"], return_tensors="pt").to(wrapper.device)
-
-        # Logit delta for expected answer token (first subword)
-        answer_tok = wrapper.tokenizer.encode(item["answer"], add_special_tokens=False)
+        # --- logit_no_mem: hooks active but store EMPTY → post_hook returns early ---
+        logit_no_mem = None
+        ans_tok_id = None
         if answer_tok:
             ans_tok_id = answer_tok[0]
             last_pos = q_inputs["input_ids"].shape[1] - 1
             with torch.no_grad():
                 logit_no_mem = wrapper.base_model(**q_inputs).logits[0, last_pos, ans_tok_id].item()
-            logit_with_mem = None  # computed during generate below
+
+        # --- write memory, then generate ---
+        wrapper.write_memory(item["memory"])
+        has_memory = wrapper.store.active_episodes > 0
+
+        if debug:
+            print(f"  [store] active_episodes={wrapper.store.active_episodes}, "
+                  f"active_count={wrapper.store.active_count}")
 
         with torch.no_grad():
             gen_ids = wrapper.base_model.generate(
                 **q_inputs,
-                max_new_tokens=20,
+                max_new_tokens=30,
                 do_sample=False,
                 pad_token_id=wrapper.tokenizer.eos_token_id,
             )
@@ -472,12 +487,12 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict], debug: bool = Fal
             correct += 1
 
         if debug:
-            # Compute logit with memory (re-run single forward, hooks active)
-            if answer_tok:
+            if ans_tok_id is not None:
                 with torch.no_grad():
                     logit_with_mem = wrapper.base_model(**q_inputs).logits[0, last_pos, ans_tok_id].item()
-                delta = logit_with_mem - logit_no_mem
-                logit_str = f"logit_delta={delta:+.2f} (no_mem={logit_no_mem:.2f} with_mem={logit_with_mem:.2f})"
+                delta = logit_with_mem - (logit_no_mem or 0)
+                logit_str = (f"logit_delta={delta:+.2f} "
+                             f"(no_mem={logit_no_mem:.2f} with_mem={logit_with_mem:.2f})")
             else:
                 logit_str = "logit_delta=N/A"
             status = "✓" if hit else "✗"
