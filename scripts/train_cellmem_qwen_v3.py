@@ -434,7 +434,7 @@ def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
     }
 
 
-def eval_generation(wrapper: CellMemWrapper, data: list[dict]) -> dict:
+def eval_generation(wrapper: CellMemWrapper, data: list[dict], debug: bool = False) -> dict:
     """Evaluate generation recall: does model generate the correct answer?"""
     wrapper._install_read_hooks()
     correct = 0
@@ -444,7 +444,19 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict]) -> dict:
         wrapper.clear_memory()
         wrapper.write_memory(item["memory"])
 
+        has_memory = wrapper.store.active_episodes > 0
+
         q_inputs = wrapper.tokenizer(item["query"], return_tensors="pt").to(wrapper.device)
+
+        # Logit delta for expected answer token (first subword)
+        answer_tok = wrapper.tokenizer.encode(item["answer"], add_special_tokens=False)
+        if answer_tok:
+            ans_tok_id = answer_tok[0]
+            last_pos = q_inputs["input_ids"].shape[1] - 1
+            with torch.no_grad():
+                logit_no_mem = wrapper.base_model(**q_inputs).logits[0, last_pos, ans_tok_id].item()
+            logit_with_mem = None  # computed during generate below
+
         with torch.no_grad():
             gen_ids = wrapper.base_model.generate(
                 **q_inputs,
@@ -452,10 +464,27 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict]) -> dict:
                 do_sample=False,
                 pad_token_id=wrapper.tokenizer.eos_token_id,
             )
+
         answer_ids = gen_ids[0, q_inputs["input_ids"].shape[1]:]
         generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
-        if item["answer"].lower() in generated.lower():
+        hit = item["answer"].lower() in generated.lower()
+        if hit:
             correct += 1
+
+        if debug:
+            # Compute logit with memory (re-run single forward, hooks active)
+            if answer_tok:
+                with torch.no_grad():
+                    logit_with_mem = wrapper.base_model(**q_inputs).logits[0, last_pos, ans_tok_id].item()
+                delta = logit_with_mem - logit_no_mem
+                logit_str = f"logit_delta={delta:+.2f} (no_mem={logit_no_mem:.2f} with_mem={logit_with_mem:.2f})"
+            else:
+                logit_str = "logit_delta=N/A"
+            status = "✓" if hit else "✗"
+            print(f"  {status} mem={has_memory} | q: {item['query'][:40]!r}")
+            print(f"      expected={item['answer']!r} | got={generated[:40]!r}")
+            print(f"      {logit_str}")
+
         wrapper.clear_memory()
 
     wrapper._remove_read_hooks()
@@ -575,7 +604,8 @@ def main():
                 lr=args.lr * 0.3, batch_size=args.batch_size, phase_name="p2")
 
     metrics_final = eval_router(wrapper, eval_data)
-    gen_metrics = eval_generation(wrapper, eval_data)
+    print("\n=== Generation debug (first 20 items) ===")
+    gen_metrics = eval_generation(wrapper, eval_data, debug=True)
     print(f"\nFinal eval:")
     print(f"  router_recall@{config.top_k}={metrics_final['recall_at_k']:.2%} (target >=80%)")
     print(f"  discrimination_gap={metrics_final['discrimination_gap']:.3f} (target >=0.3)")
