@@ -352,3 +352,42 @@ class TestIntegrationSmoke:
             f"Memory injection had no effect on logits (max diff={diff:.2e}). "
             "Read hooks are not modifying the residual stream."
         )
+
+    def test_memory_injection_improves_target_logit(self, wrapper):
+        """Post-hook injection must INCREASE logit for the stored answer.
+
+        Validates injection direction: storing 'Pyrothene' in memory and then
+        querying should raise the logit for 'P' (start of 'Pyrothene') at the
+        last query position. This confirms post-hook adds useful signal rather
+        than corrupting the residual (the old pre-hook bug raised LM loss and
+        gave generation_recall=0%).
+        """
+        wrapper.clear_memory()
+        wrapper.write_memory("Dr. Elena Voss discovered Pyrothene in 2031 at CERN")
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+
+        query = "What did Dr. Voss discover? Pyrothene"
+        tokens = wrapper.tokenizer(query, return_tensors="pt")
+        tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
+
+        # Token id for 'P' (first subword of 'Pyrothene' in most tokenizers)
+        pyrothene_tok = wrapper.tokenizer.encode("Pyrothene", add_special_tokens=False)[0]
+
+        last_pos = tokens["input_ids"].shape[1] - 2  # position predicting 'Pyrothene'
+
+        with torch.no_grad():
+            logit_no_mem = wrapper.base_model(**tokens).logits[0, last_pos, pyrothene_tok].item()
+
+        wrapper._install_read_hooks()
+        try:
+            with torch.no_grad():
+                logit_with_mem = wrapper.base_model(**tokens).logits[0, last_pos, pyrothene_tok].item()
+        finally:
+            wrapper._remove_read_hooks()
+
+        assert logit_with_mem > logit_no_mem, (
+            f"Memory injection did NOT increase target logit: "
+            f"no_mem={logit_no_mem:.3f}, with_mem={logit_with_mem:.3f}. "
+            "Injection direction is wrong — may be corrupting residual stream."
+        )

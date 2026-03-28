@@ -112,87 +112,94 @@ class CellMemWrapper:
         return list(self.router.parameters())
 
     def _install_read_hooks(self):
-        """Install hooks that inject memory into the residual stream during forward."""
+        """Install hooks that inject memory into the residual stream during forward.
+
+        Uses paired pre+post hooks: pre-hook captures normed_h (unmodified) so
+        that post-hook can compute memory cross-attention and add it directly to
+        the self_attn OUTPUT (before the layer residual connection). This avoids
+        corrupting q_proj/k_proj/v_proj inputs, which caused LM loss to spike
+        when injecting into the pre-hook input (pre-hook bug: α=1.0 into normed_h
+        disrupted all downstream attention projections).
+        """
+        ALPHA = 0.1  # scale memory injection to avoid overwhelming residual stream
         self._remove_read_hooks()
         for layer_pos, layer_idx in enumerate(self.layer_indices):
             attn = self.base_model.model.layers[layer_idx].self_attn
+            normed_h_buf = [None]  # shared buffer between pre and post hook
 
-            def make_hook(lpos):
-                def hook(module, args, kwargs):
-                    # Qwen calls attention with keyword args; hidden_states may be in kwargs or args
-                    h_in_kwargs = 'hidden_states' in kwargs
-                    if h_in_kwargs:
-                        h = kwargs['hidden_states']
+            def make_hooks(lpos, buf):
+                def pre_hook(module, args, kwargs):
+                    # Capture normed hidden_states WITHOUT modifying them
+                    if 'hidden_states' in kwargs:
+                        buf[0] = kwargs['hidden_states']
                     elif isinstance(args, tuple) and len(args) > 0:
-                        h = args[0]
+                        buf[0] = args[0]
                     else:
-                        return args, kwargs
+                        buf[0] = None
+                    return args, kwargs  # pass through unmodified
+
+                def post_hook(module, input, output):
+                    normed_h = buf[0]
+                    buf[0] = None  # clear for next call
+                    if normed_h is None:
+                        return output
 
                     router_keys = self.store.get_router_keys()
                     if router_keys.shape[0] == 0:
-                        return args, kwargs
+                        return output
 
                     router_keys = router_keys.to(self.device)
                     router_dtype = next(self.router.parameters()).dtype
-                    indices, scores = self.router.route(h.to(router_dtype), router_keys)
+                    indices, scores = self.router.route(
+                        normed_h.to(router_dtype), router_keys
+                    )
                     if indices.shape[-1] == 0:
-                        return args, kwargs
+                        return output
 
-                    # Use mean over batch/time for episode selection: take first batch, first token
-                    ep_indices = indices[0, 0, :].tolist()  # [top_k] episode indices
+                    ep_indices = indices[0, 0, :].tolist()
                     result = self.store.read([int(i) for i in ep_indices])
                     if result is None:
-                        return args, kwargs
+                        return output
 
                     k_mem, v_mem = result  # [n_layers, n_tokens, n_kv_heads, d_head]
-                    k_layer = k_mem[lpos].to(self.device)  # [n_tokens, n_kv_heads, d_head]
+                    k_layer = k_mem[lpos].to(self.device)
                     v_layer = v_mem[lpos].to(self.device)
 
-                    # Attend: Q from backbone q_proj (frozen), K/V from memory (no RoPE)
-                    B, T, D = h.shape
-                    q = module.q_proj(h)  # [B, T, n_heads * d_head]
+                    B, T, D = normed_h.shape
+                    q = module.q_proj(normed_h)  # [B, T, n_heads * d_head]
 
                     n_heads = self.base_model.config.num_attention_heads
                     n_kv_heads_cfg = self.base_model.config.num_key_value_heads
-                    d_head = self._d_head  # use actual d_head from k_proj (correct for GQA)
+                    d_head = self._d_head
 
-                    # Reshape Q for multi-head attention
-                    q = q.view(B, T, n_heads, d_head).transpose(1, 2)  # [B, n_heads, T, d_head]
+                    q = q.view(B, T, n_heads, d_head).transpose(1, 2)
 
-                    N_mem = k_layer.shape[0]
-                    # k_layer: [N_mem, n_kv_heads, d_head] → [B, n_kv_heads, N_mem, d_head]
                     k_m = k_layer.unsqueeze(0).expand(B, -1, -1, -1).permute(0, 2, 1, 3)
                     v_m = v_layer.unsqueeze(0).expand(B, -1, -1, -1).permute(0, 2, 1, 3)
 
-                    # Expand KV heads to match Q heads (GQA)
                     if n_kv_heads_cfg < n_heads:
                         repeat = n_heads // n_kv_heads_cfg
                         k_m = k_m.repeat_interleave(repeat, dim=1)
                         v_m = v_m.repeat_interleave(repeat, dim=1)
 
-                    # Cast memory tensors to match h dtype
-                    k_m = k_m.to(h.dtype)
-                    v_m = v_m.to(h.dtype)
+                    k_m = k_m.to(normed_h.dtype)
+                    v_m = v_m.to(normed_h.dtype)
 
-                    # Scaled dot-product attention (no RoPE on memory K/V)
-                    attn_out = F.scaled_dot_product_attention(q, k_m, v_m)  # [B, n_heads, T, d_head]
-                    attn_out = attn_out.transpose(1, 2).reshape(B, T, n_heads * d_head)  # [B, T, n_heads*d_head]
-                    attn_out = module.o_proj(attn_out)  # [B, T, D]
+                    mem_attn = F.scaled_dot_product_attention(q, k_m, v_m)
+                    mem_attn = mem_attn.transpose(1, 2).reshape(B, T, n_heads * d_head)
+                    mem_attn = module.o_proj(mem_attn)  # [B, T, D]
 
-                    # Residual update
-                    new_h = h + attn_out
+                    # Inject into self_attn OUTPUT (before layer residual), not into normed_h
+                    if isinstance(output, tuple):
+                        return (output[0] + ALPHA * mem_attn,) + output[1:]
+                    return output + ALPHA * mem_attn
 
-                    # Return modified hidden_states in correct position
-                    if h_in_kwargs:
-                        kwargs['hidden_states'] = new_h
-                        return args, kwargs
-                    else:
-                        return (new_h,) + args[1:], kwargs
+                return pre_hook, post_hook
 
-                return hook
-
-            h = attn.register_forward_pre_hook(make_hook(layer_pos), with_kwargs=True)
-            self._read_hooks.append(h)
+            pre, post = make_hooks(layer_pos, normed_h_buf)
+            h1 = attn.register_forward_pre_hook(pre, with_kwargs=True)
+            h2 = attn.register_forward_hook(post)
+            self._read_hooks.extend([h1, h2])
 
     def _remove_read_hooks(self):
         for h in self._read_hooks:
