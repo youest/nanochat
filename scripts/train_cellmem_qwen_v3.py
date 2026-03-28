@@ -121,7 +121,7 @@ class CellMemWrapper:
         when injecting into the pre-hook input (pre-hook bug: α=1.0 into normed_h
         disrupted all downstream attention projections).
         """
-        ALPHA = 0.1  # scale memory injection to avoid overwhelming residual stream
+        ALPHA = 0.5  # post-hook is safe at higher alpha (backbone self_attn runs clean)
         self._remove_read_hooks()
         for layer_pos, layer_idx in enumerate(self.layer_indices):
             attn = self.base_model.model.layers[layer_idx].self_attn
@@ -150,8 +150,13 @@ class CellMemWrapper:
 
                     router_keys = router_keys.to(self.device)
                     router_dtype = next(self.router.parameters()).dtype
+                    # Mean-pool over time dim: router was trained on mean-pooled
+                    # query reps, so inference must match. Using indices[0,0,:]
+                    # (first token only) caused wrong episode selection despite
+                    # 100% router_recall on the mean-pooled eval.
+                    h_pooled = normed_h.mean(dim=1, keepdim=True)  # [B, 1, D]
                     indices, scores = self.router.route(
-                        normed_h.to(router_dtype), router_keys
+                        h_pooled.to(router_dtype), router_keys
                     )
                     if indices.shape[-1] == 0:
                         return output
@@ -528,6 +533,7 @@ def main():
         router_layers=layer_indices,
         episode_size=8,
         top_k=4,
+        surprise_threshold=2.0,  # lowered from 4.0: more tokens stored → more episodes
     )
     wrapper = CellMemWrapper(model, tokenizer, layer_indices, config=config, device=args.device)
 
