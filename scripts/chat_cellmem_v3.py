@@ -7,10 +7,12 @@ Each user message and bot response is written to memory via the
 surprise-gated write path. When answering, the router retrieves
 relevant memories and injects them as context.
 
+Memory persists across sessions via auto-save/load.
+
 Commands:
-  /clear          Clear all memories
+  /clear          Clear all memories (also deletes saved file)
   /stats          Show memory stats
-  /quit           Exit
+  /quit           Exit (memory auto-saved)
 
 Usage:
   python scripts/chat_cellmem_v3.py --device cuda
@@ -28,6 +30,26 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from nanochat.cellmem_v3 import CellMemConfig
 from scripts.train_cellmem_qwen_v3 import CellMemWrapper
 
+DEFAULT_MEMORY_DIR = Path("/tmp/cellmem_v3_memory")
+
+
+def save_memory(wrapper: CellMemWrapper, memory_dir: Path):
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    wrapper.store.save(memory_dir / "memory.pt")
+    n = wrapper.store.active_episodes
+    print(f"  [memory saved: {n} episodes]")
+
+
+def load_memory(wrapper: CellMemWrapper, memory_dir: Path) -> bool:
+    mem_path = memory_dir / "memory.pt"
+    if mem_path.exists():
+        wrapper.store.load(mem_path)
+        n = wrapper.store.active_episodes
+        texts = [t for t in wrapper.store.episode_texts[:n] if t]
+        print(f"  [memory loaded: {n} episodes, {len(texts)} texts]")
+        return True
+    return False
+
 
 def main():
     parser = argparse.ArgumentParser(description="CellMem v3 chat with automatic memory")
@@ -35,11 +57,14 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--router-ckpt", default=None, help="Path to trained router checkpoint")
     parser.add_argument("--max-tokens", type=int, default=200)
+    parser.add_argument("--memory-dir", type=str, default=str(DEFAULT_MEMORY_DIR),
+                        help="Directory for persistent memory storage")
     args = parser.parse_args()
+    memory_dir = Path(args.memory_dir)
 
     print(f"Loading {args.model} on {args.device}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
     model = model.to(args.device)
 
     n_layers = model.config.num_hidden_layers
@@ -58,28 +83,36 @@ def main():
         state = torch.load(args.router_ckpt, map_location=args.device, weights_only=True)
         wrapper.router.load_state_dict(state)
 
+    # Load persisted memory
+    load_memory(wrapper, memory_dir)
+
     print(f"\nCellMem v3 Chat — automatic memory")
-    print(f"Everything you say is memorized. The model retrieves relevant memories automatically.")
+    print(f"Everything you say is memorized. Memory persists across sessions.")
+    print(f"Memory dir: {memory_dir}")
     print(f"Commands: /clear, /stats, /quit\n")
 
-    turn = 0
     while True:
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
+            print()
+            save_memory(wrapper, memory_dir)
+            print("Bye!")
             break
 
         if not user_input:
             continue
 
         if user_input.lower() == "/quit":
+            save_memory(wrapper, memory_dir)
             print("Bye!")
             break
 
         if user_input.lower() == "/clear":
             wrapper.clear_memory()
-            turn = 0
+            mem_path = memory_dir / "memory.pt"
+            if mem_path.exists():
+                mem_path.unlink()
             print("Memory cleared.\n")
             continue
 
@@ -96,7 +129,6 @@ def main():
 
         # 1. Memorize user message automatically
         wrapper.write_memory(f"User said: {user_input}")
-        turn += 1
 
         # 2. Retrieve relevant memories and generate response
         prompt = wrapper.retrieve_and_format(user_input)
@@ -118,6 +150,9 @@ def main():
 
         # 3. Memorize bot response too
         wrapper.write_memory(f"Assistant said: {answer}")
+
+        # 4. Auto-save after each turn
+        save_memory(wrapper, memory_dir)
 
 
 if __name__ == "__main__":
