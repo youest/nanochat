@@ -127,10 +127,9 @@ def main():
             print()
             continue
 
-        # 1. Memorize user message before generating (for retrieval)
-        wrapper.write_memory(f"User: {user_input}")
+        # 1. Retrieve relevant memories (from previous turns, not this one)
 
-        # 2. Retrieve relevant memories and generate response
+        # 2. Generate response with memory context
         prompt = wrapper.retrieve_and_format(user_input)
         inputs = tokenizer(prompt, return_tensors="pt").to(args.device)
 

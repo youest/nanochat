@@ -112,8 +112,27 @@ class CellMemWrapper:
     def trainable_params(self):
         return list(self.router.parameters())
 
+    def _is_text_redundant(self, text: str, threshold: float = 0.7) -> bool:
+        """Check if text is too similar to an already stored episode text."""
+        existing = self.store.read_texts(list(range(self.store.active_episodes)))
+        if not existing:
+            return False
+        # Simple word-overlap check (Jaccard on words)
+        new_words = set(text.lower().split())
+        for stored in existing:
+            stored_words = set(stored.lower().split())
+            if not new_words or not stored_words:
+                continue
+            overlap = len(new_words & stored_words)
+            union = len(new_words | stored_words)
+            if union > 0 and overlap / union > threshold:
+                return True
+        return False
+
     def write_memory(self, text: str):
         """Process text and write surprising tokens to memory store."""
+        if self._is_text_redundant(text):
+            return
         self._current_write_text = text
         self._text_used = False  # only attach text to the first episode
         inputs = self.tokenizer(text, return_tensors="pt").to(self.device)

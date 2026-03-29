@@ -135,10 +135,8 @@ async def chat_completions(request: ChatRequest):
     if not user_msg:
         raise HTTPException(400, "No user message")
 
-    # Memorize user message (for retrieval on this turn)
-    wrapper.write_memory(f"User: {user_msg}")
-
-    # Build prompt with memory retrieval
+    # Retrieve memories BEFORE writing (use existing memories for context)
+    # Don't write user message separately — we write the full turn after generation
     prompt = wrapper.retrieve_and_format(user_msg)
     inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
 
