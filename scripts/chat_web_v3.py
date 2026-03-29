@@ -135,17 +135,19 @@ async def chat_completions(request: ChatRequest):
     if not user_msg:
         raise HTTPException(400, "No user message")
 
-    # Retrieve memories BEFORE writing (use existing memories for context)
-    # Don't write user message separately — we write the full turn after generation
+    # Hybrid MSA: text prefix + KV cache injection
     prompt = wrapper.retrieve_and_format(user_msg)
     inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+
+    # KV cache injection
+    mem_cache = wrapper.inject_memory_kv(user_msg)
 
     # Stream generation
     streamer = TextIteratorStreamer(wrapper.tokenizer, skip_prompt=True, skip_special_tokens=True)
     max_tokens = request.max_tokens or args.max_tokens
 
     gen_kwargs = dict(
-        **inputs,
+        input_ids=inputs["input_ids"],
         max_new_tokens=max_tokens,
         do_sample=True,
         temperature=max(request.temperature or 0.7, 0.01),
@@ -153,6 +155,19 @@ async def chat_completions(request: ChatRequest):
         pad_token_id=wrapper.tokenizer.eos_token_id,
         streamer=streamer,
     )
+
+    if mem_cache is not None:
+        n_mem = mem_cache.get_seq_length()
+        seq_len = inputs["input_ids"].shape[1]
+        gen_kwargs["past_key_values"] = mem_cache
+        gen_kwargs["attention_mask"] = torch.ones(
+            1, n_mem + seq_len, device=wrapper.device, dtype=torch.long)
+        gen_kwargs["position_ids"] = torch.arange(
+            n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
+        gen_kwargs["cache_position"] = torch.arange(
+            n_mem, n_mem + seq_len, device=wrapper.device)
+    else:
+        gen_kwargs["attention_mask"] = inputs.get("attention_mask")
 
     thread = Thread(target=wrapper.base_model.generate, kwargs=gen_kwargs)
     thread.start()

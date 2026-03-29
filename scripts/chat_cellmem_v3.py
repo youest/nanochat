@@ -127,24 +127,11 @@ def main():
             print()
             continue
 
-        # 1. Retrieve relevant memories (from previous turns, not this one)
-
-        # 2. Generate response with memory context
-        prompt = wrapper.retrieve_and_format(user_input)
-        inputs = tokenizer(prompt, return_tensors="pt").to(args.device)
-
-        with torch.no_grad():
-            gen_ids = model.generate(
-                **inputs,
-                max_new_tokens=args.max_tokens,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-
-        answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
-        answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+        # Generate with hybrid MSA: text prefix + KV cache injection
+        answer = wrapper.generate_with_memory(
+            user_input, max_new_tokens=args.max_tokens,
+            do_sample=True, temperature=0.7, top_p=0.9,
+        )
         print(f"Bot: {answer}\n")
 
         # 3. Memorize full turn as one unit (user + bot together for context)

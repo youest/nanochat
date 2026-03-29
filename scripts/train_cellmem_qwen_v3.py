@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from nanochat.cellmem_v3 import CellMemConfig, MemoryRouter, MemoryStore
@@ -228,6 +228,125 @@ class CellMemWrapper:
         self._episode_token_count = 0
         self._current_write_text = None
 
+    # --- KV Cache Injection with Parallel RoPE ---
+
+    def inject_memory_kv(self, query_text: str) -> DynamicCache | None:
+        """Inject memory K/V into DynamicCache with Parallel RoPE.
+
+        Returns a DynamicCache that can be passed as past_key_values.
+        The caller must extend attention_mask and offset position_ids
+        by cache.get_seq_length().
+        """
+        router_keys = self.store.get_router_keys()
+        if router_keys.shape[0] == 0:
+            return None
+
+        # Route query to find relevant episodes
+        q_inputs = self.tokenizer(query_text, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            q_out = self.base_model(**q_inputs, output_hidden_states=True)
+        first_hs_idx = min(self.layer_indices[0] + 1, len(q_out.hidden_states) - 1)
+        router_dtype = next(self.router.parameters()).dtype
+        h_q = q_out.hidden_states[first_hs_idx].to(router_dtype)
+        h_pooled = h_q.mean(dim=1, keepdim=True)
+        indices, scores = self.router.route(h_pooled, router_keys.to(self.device))
+        if indices.shape[-1] == 0:
+            return None
+        ep_indices = indices[0, 0, :].tolist()
+
+        # Read pre-RoPE K/V from store
+        result = self.store.read([int(i) for i in ep_indices])
+        if result is None:
+            return None
+        mem_k, mem_v = result  # [n_router_layers, n_tokens, n_kv_heads, d_head]
+
+        # Parallel RoPE: memory tokens get independent positions [0, 1, ..., N-1]
+        n_mem_tokens = mem_k.shape[1]
+        mem_pos_ids = torch.arange(n_mem_tokens, device=self.device).unsqueeze(0)
+
+        # Get RoPE cos/sin from the model's rotary embedding
+        rotary_emb = self.base_model.model.rotary_emb
+        cos, sin = rotary_emb(
+            mem_k.new_zeros(1, n_mem_tokens, self.base_model.config.hidden_size).to(self.device),
+            mem_pos_ids,
+        )
+
+        # Import apply_rotary_pos_emb from the model's module
+        model_module = type(self.base_model).__module__
+        import importlib
+        modeling_mod = importlib.import_module(model_module)
+        apply_rotary = modeling_mod.apply_rotary_pos_emb
+
+        cache = DynamicCache()
+        n_total_layers = self.base_model.config.num_hidden_layers
+        n_kv_heads = self.base_model.config.num_key_value_heads
+        d_head = self._d_head
+        dtype = next(self.base_model.parameters()).dtype
+
+        for layer_idx in range(n_total_layers):
+            if layer_idx in self.layer_indices:
+                li = self.layer_indices.index(layer_idx)
+                k = mem_k[li].unsqueeze(0).to(self.device)  # [1, n_tokens, n_kv_heads, d_head]
+                v = mem_v[li].unsqueeze(0).to(self.device)
+
+                # Transpose to [1, n_kv_heads, n_tokens, d_head] (attention format)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+
+                # Apply k_norm if present (Qwen3 has QKNorm, Qwen2.5 doesn't)
+                attn = self.base_model.model.layers[layer_idx].self_attn
+                if hasattr(attn, 'k_norm'):
+                    k = attn.k_norm(k)
+
+                # Apply RoPE to K only (V never gets RoPE)
+                k, _ = apply_rotary(k, k, cos, sin)
+
+                cache.update(k.to(dtype), v.to(dtype), layer_idx)
+            else:
+                # Zero K/V for non-memory layers (same length for consistent attention_mask)
+                cache.update(
+                    torch.zeros(1, n_kv_heads, n_mem_tokens, d_head, device=self.device, dtype=dtype),
+                    torch.zeros(1, n_kv_heads, n_mem_tokens, d_head, device=self.device, dtype=dtype),
+                    layer_idx,
+                )
+
+        return cache
+
+    def generate_with_memory(self, query_text: str, max_new_tokens: int = 30,
+                              do_sample: bool = False, **gen_kwargs) -> str:
+        """Generate with hybrid MSA: text prefix + KV cache injection."""
+        # Text prefix (retrieve memory texts into prompt)
+        prompt = self.retrieve_and_format(query_text)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+
+        # KV cache injection
+        mem_cache = self.inject_memory_kv(query_text)
+
+        gen_args = dict(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            pad_token_id=self.tokenizer.eos_token_id,
+            **gen_kwargs,
+        )
+
+        if mem_cache is not None:
+            n_mem = mem_cache.get_seq_length()
+            seq_len = inputs["input_ids"].shape[1]
+            gen_args["past_key_values"] = mem_cache
+            gen_args["attention_mask"] = torch.ones(
+                1, n_mem + seq_len, device=self.device, dtype=torch.long)
+            gen_args["position_ids"] = torch.arange(
+                n_mem, n_mem + seq_len, device=self.device).unsqueeze(0)
+            gen_args["cache_position"] = torch.arange(
+                n_mem, n_mem + seq_len, device=self.device)
+
+        with torch.no_grad():
+            gen_ids = self.base_model.generate(**gen_args)
+
+        answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
+        return self.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+
     # --- Text prefix injection (MSA-inspired) ---
 
     def retrieve_and_format(self, query_text: str) -> str:
@@ -417,11 +536,14 @@ def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
     }
 
 
-def eval_generation(wrapper: CellMemWrapper, data: list[dict], debug: bool = False) -> dict:
-    """Evaluate generation recall using text prefix injection.
+def eval_generation(wrapper: CellMemWrapper, data: list[dict],
+                    mode: str = "text_only", debug: bool = False) -> dict:
+    """Evaluate generation recall with different memory injection modes.
 
-    Writes memory, routes query, retrieves text, formats prompt with
-    instruct chat template, then generates and checks answer.
+    Modes:
+        text_only: Text prefix injection only (baseline)
+        kv_only:   KV cache injection only (no text in prompt)
+        hybrid:    Text prefix + KV cache injection (MSA approach)
     """
     correct = 0
     n = min(20, len(data))
@@ -431,28 +553,54 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict], debug: bool = Fal
         wrapper.write_memory(item["memory"])
         has_memory = wrapper.store.active_episodes > 0
 
-        # Route + retrieve text → format prompt
         q_text = f"Question: {item['query']}\nAnswer:"
-        prompt = wrapper.retrieve_and_format(q_text)
-        inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
 
-        with torch.no_grad():
-            gen_ids = wrapper.base_model.generate(
-                **inputs,
-                max_new_tokens=30,
-                do_sample=False,
+        if mode == "hybrid":
+            generated = wrapper.generate_with_memory(q_text, max_new_tokens=30)
+        elif mode == "kv_only":
+            # KV cache injection with plain query (no text prefix)
+            mem_cache = wrapper.inject_memory_kv(q_text)
+            prompt = wrapper._format_query_only(q_text)
+            inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+
+            gen_args = dict(
+                input_ids=inputs["input_ids"],
+                max_new_tokens=30, do_sample=False,
                 pad_token_id=wrapper.tokenizer.eos_token_id,
             )
+            if mem_cache is not None:
+                n_mem = mem_cache.get_seq_length()
+                seq_len = inputs["input_ids"].shape[1]
+                gen_args["past_key_values"] = mem_cache
+                gen_args["attention_mask"] = torch.ones(
+                    1, n_mem + seq_len, device=wrapper.device, dtype=torch.long)
+                gen_args["position_ids"] = torch.arange(
+                    n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
+                gen_args["cache_position"] = torch.arange(
+                    n_mem, n_mem + seq_len, device=wrapper.device)
 
-        answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
-        generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+            with torch.no_grad():
+                gen_ids = wrapper.base_model.generate(**gen_args)
+            answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
+            generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+        else:  # text_only
+            prompt = wrapper.retrieve_and_format(q_text)
+            inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+            with torch.no_grad():
+                gen_ids = wrapper.base_model.generate(
+                    **inputs, max_new_tokens=30, do_sample=False,
+                    pad_token_id=wrapper.tokenizer.eos_token_id,
+                )
+            answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
+            generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+
         hit = item["answer"].lower() in generated.lower()
         if hit:
             correct += 1
 
         if debug:
             status = "✓" if hit else "✗"
-            print(f"  {status} mem={has_memory} | q: {item['query'][:40]!r}")
+            print(f"  {status} [{mode}] mem={has_memory} | q: {item['query'][:40]!r}")
             print(f"      expected={item['answer']!r} | got={generated[:50]!r}")
 
         wrapper.clear_memory()
@@ -566,24 +714,40 @@ def main():
             torch.save(wrapper.router.state_dict(), ckpt_dir / "router_latest.pt")
             print(f"Router checkpoint saved: {p1_path}")
 
-    # Phase 2: generation validation (text prefix injection)
+    # Phase 2: generation validation — 3-way comparison
     print("\n=== Phase 2: Generation Validation ===")
-    gen_metrics = eval_generation(wrapper, eval_data, debug=True)
     metrics_final = eval_router(wrapper, eval_data)
 
-    if gen_metrics["generation_recall"] < 0.75 and args.epochs2 > 0:
-        print(f"\nGeneration recall {gen_metrics['generation_recall']:.2%} < 75%, "
+    print("\n--- text_only (baseline) ---")
+    gen_text = eval_generation(wrapper, eval_data, mode="text_only", debug=True)
+    print(f"  text_only recall: {gen_text['generation_recall']:.2%}")
+
+    print("\n--- kv_only (KV cache injection) ---")
+    gen_kv = eval_generation(wrapper, eval_data, mode="kv_only", debug=True)
+    print(f"  kv_only recall: {gen_kv['generation_recall']:.2%}")
+
+    print("\n--- hybrid (text + KV injection) ---")
+    gen_hybrid = eval_generation(wrapper, eval_data, mode="hybrid", debug=True)
+    print(f"  hybrid recall: {gen_hybrid['generation_recall']:.2%}")
+
+    # Additional training if text_only baseline too low
+    if gen_text["generation_recall"] < 0.75 and args.epochs2 > 0:
+        print(f"\nText-only recall {gen_text['generation_recall']:.2%} < 75%, "
               "running additional router training...")
         train_phase(wrapper, train_data, n_epochs=args.epochs2,
                     lm_weight=0.0, contrastive_weight=1.0,
                     lr=args.lr * 0.3, batch_size=args.batch_size, phase_name="p2")
         metrics_final = eval_router(wrapper, eval_data)
-        gen_metrics = eval_generation(wrapper, eval_data, debug=True)
+        gen_text = eval_generation(wrapper, eval_data, mode="text_only", debug=True)
+        gen_kv = eval_generation(wrapper, eval_data, mode="kv_only", debug=True)
+        gen_hybrid = eval_generation(wrapper, eval_data, mode="hybrid", debug=True)
 
     print(f"\nFinal eval:")
     print(f"  router_recall@{config.top_k}={metrics_final['recall_at_k']:.2%} (target >=80%)")
     print(f"  discrimination_gap={metrics_final['discrimination_gap']:.3f} (target >=0.3)")
-    print(f"  generation_recall={gen_metrics['generation_recall']:.2%} (target >=75%)")
+    print(f"  text_only_recall={gen_text['generation_recall']:.2%} (baseline)")
+    print(f"  kv_only_recall={gen_kv['generation_recall']:.2%} (target >=50%)")
+    print(f"  hybrid_recall={gen_hybrid['generation_recall']:.2%} (target >=85%)")
 
     if ckpt_dir:
         final_path = ckpt_dir / "router_final.pt"

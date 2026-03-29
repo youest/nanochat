@@ -429,3 +429,81 @@ class TestIntegrationSmoke:
         with torch.no_grad():
             out2 = wrapper.base_model(**tokens).logits
         assert torch.allclose(out1, out2, atol=1e-5)
+
+    # --- KV Cache Injection Tests ---
+
+    def test_inject_memory_kv_empty_store(self, wrapper):
+        """Empty store should return None."""
+        wrapper.clear_memory()
+        cache = wrapper.inject_memory_kv("test query")
+        assert cache is None
+
+    def test_inject_memory_kv_returns_cache(self, wrapper):
+        """After writing memory, inject_memory_kv returns a DynamicCache with correct shape."""
+        wrapper.clear_memory()
+        wrapper.write_memory("Dr. Elena Voss discovered Pyrothene in 2031 at CERN in Geneva")
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        cache = wrapper.inject_memory_kv("What did Dr. Voss discover?")
+        assert cache is not None
+        assert cache.get_seq_length() > 0
+        # All layers should have same seq length in cache
+        n_total = wrapper.base_model.config.num_hidden_layers
+        mem_len = cache.get_seq_length()
+        for i in range(n_total):
+            k, v = cache[i]
+            assert k.shape[-2] == mem_len, f"Layer {i} has wrong cache length"
+
+    def test_generate_with_kv_cache(self, wrapper):
+        """Model should generate without crash when given memory KV cache."""
+        wrapper.clear_memory()
+        wrapper.write_memory(
+            "The Cerulean Tower in New Osaka stands exactly 847 meters tall. "
+            "It was designed by architect Mira Schulz in 2045 and completed in 2048. "
+            "The tower features a revolutionary quantum glass facade that changes color "
+            "based on atmospheric conditions and internal energy generation."
+        )
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        cache = wrapper.inject_memory_kv("How tall is the Cerulean Tower?")
+        assert cache is not None
+        inputs = wrapper.tokenizer("How tall is the tower?", return_tensors="pt").to(wrapper.device)
+        input_ids = inputs["input_ids"]
+        n_mem = cache.get_seq_length()
+        seq_len = input_ids.shape[1]
+        attn_mask = torch.ones(1, n_mem + seq_len, device=wrapper.device, dtype=torch.long)
+        pos_ids = torch.arange(n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
+        cache_pos = torch.arange(n_mem, n_mem + seq_len, device=wrapper.device)
+        with torch.no_grad():
+            gen_ids = wrapper.base_model.generate(
+                input_ids=input_ids, past_key_values=cache,
+                attention_mask=attn_mask, position_ids=pos_ids,
+                cache_position=cache_pos,
+                max_new_tokens=10, do_sample=False,
+                pad_token_id=wrapper.tokenizer.eos_token_id,
+            )
+        assert gen_ids.shape[1] > seq_len
+
+    def test_kv_injection_changes_logits(self, wrapper):
+        """KV injection should change model output logits."""
+        wrapper.clear_memory()
+        wrapper.write_memory("Pyrothene was discovered in 2031 at CERN by Dr. Elena Voss in Switzerland")
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        inputs = wrapper.tokenizer("What is Pyrothene?", return_tensors="pt").to(wrapper.device)
+        input_ids = inputs["input_ids"]
+        with torch.no_grad():
+            out_base = wrapper.base_model(input_ids=input_ids).logits.clone()
+        cache = wrapper.inject_memory_kv("What is Pyrothene?")
+        assert cache is not None
+        n_mem = cache.get_seq_length()
+        seq_len = input_ids.shape[1]
+        attn_mask = torch.ones(1, n_mem + seq_len, device=wrapper.device, dtype=torch.long)
+        pos_ids = torch.arange(n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
+        with torch.no_grad():
+            out_mem = wrapper.base_model(
+                input_ids=input_ids, past_key_values=cache,
+                attention_mask=attn_mask, position_ids=pos_ids,
+            ).logits
+        assert not torch.allclose(out_base, out_mem, atol=1e-3), \
+            "KV injection should change logits"
