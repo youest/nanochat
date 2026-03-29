@@ -122,7 +122,10 @@ class CellMemWrapper:
         )
 
         self.surprise_calc = SurpriseCalculator(self.config)
-        self.interceptor = KVInterceptor(model, layer_indices, model_type="qwen")
+        # Intercept ALL layers: K/V for router layers, hidden states for all
+        all_layers = list(range(model.config.num_hidden_layers))
+        self.interceptor = KVInterceptor(
+            model, all_layers, model_type="qwen", capture_hidden_states=True)
         self._episode_buffer: list = []  # hidden states for current episode
         self._episode_token_count = 0
         self._episode_token_ids: list = []  # token ids for current episode (for text decoding)
@@ -134,8 +137,8 @@ class CellMemWrapper:
 
     def trainable_params(self):
         params = list(self.router.parameters())
-        # Add LoRA params if installed
-        for layer_idx in self.layer_indices:
+        # Add LoRA params if installed (any layer)
+        for layer_idx in range(self.base_model.config.num_hidden_layers):
             attn = self.base_model.model.layers[layer_idx].self_attn
             if hasattr(attn, '_original_q_proj'):
                 lora = attn.q_proj
@@ -143,9 +146,17 @@ class CellMemWrapper:
                 params.extend(lora.lora_B.parameters())
         return params
 
-    def install_memory_lora(self, rank: int = 8, scale: float = 1.0):
-        """Install LoRA on q_proj of memory layers to learn to attend to memory K/V."""
-        for layer_idx in self.layer_indices:
+    def install_memory_lora(self, rank: int = 8, scale: float = 1.0,
+                              all_layers: bool = False):
+        """Install LoRA on q_proj to learn to attend to memory.
+
+        Args:
+            all_layers: If True, install on ALL layers (for HS injection).
+                       If False, only on memory layers (for KV injection).
+        """
+        target_layers = (list(range(self.base_model.config.num_hidden_layers))
+                        if all_layers else self.layer_indices)
+        for layer_idx in target_layers:
             attn = self.base_model.model.layers[layer_idx].self_attn
             if hasattr(attn, '_original_q_proj'):
                 continue  # Already installed
@@ -156,8 +167,8 @@ class CellMemWrapper:
             attn.q_proj = lora
 
     def remove_memory_lora(self):
-        """Remove LoRA from memory layers, restoring original q_proj."""
-        for layer_idx in self.layer_indices:
+        """Remove LoRA from all layers that have it, restoring original q_proj."""
+        for layer_idx in range(self.base_model.config.num_hidden_layers):
             attn = self.base_model.model.layers[layer_idx].self_attn
             if hasattr(attn, '_original_q_proj'):
                 attn.q_proj = attn._original_q_proj
@@ -203,6 +214,7 @@ class CellMemWrapper:
         write_mask = self.surprise_calc.get_write_mask(surprises)  # [1, T] bool
 
         kv_buf = self.interceptor.get_buffered_kv()  # {layer_idx: (K, V)}
+        hs_buf = self.interceptor.get_buffered_hidden_states()  # {layer_idx: [1, T, D]}
         if not kv_buf:
             return
 
@@ -212,9 +224,14 @@ class CellMemWrapper:
         first_hs_idx = min(self.layer_indices[0] + 1, len(hidden_states) - 1)
         first_router_layer_hs = hidden_states[first_hs_idx]  # [1, T, D]
 
+        # Track which token indices are written (for hidden state slicing)
+        written_token_indices = []
+
         for t in range(T):
             if not write_mask[0, t].item():
                 continue
+
+            written_token_indices.append(t)
 
             # Build per-layer K/V dict for this token
             kv_list_k = []
@@ -222,10 +239,8 @@ class CellMemWrapper:
             for li, layer_idx in enumerate(self.layer_indices):
                 if layer_idx in kv_buf:
                     k, v = kv_buf[layer_idx]  # [1, T, n_kv_heads * d_head]
-                    # Slice token t
-                    k_t = k[0, t]  # [n_kv_heads * d_head]
+                    k_t = k[0, t]
                     v_t = v[0, t]
-                    # Reshape to [n_kv_heads, d_head]
                     if k_t.dim() == 1:
                         n_kv = self.base_model.config.num_key_value_heads
                         d = k_t.shape[0] // n_kv
@@ -235,15 +250,16 @@ class CellMemWrapper:
                     kv_list_v.append(v_t)
 
             if not kv_list_k:
+                written_token_indices.pop()
                 continue
 
             kv_dict = {
-                "keys": torch.stack(kv_list_k, dim=0),    # [n_layers, n_kv_heads, d_head]
+                "keys": torch.stack(kv_list_k, dim=0),
                 "values": torch.stack(kv_list_v, dim=0),
             }
 
             # Episode routing: accumulate and encode every episode_size tokens
-            h_t = first_router_layer_hs[0, t]  # [d_model]
+            h_t = first_router_layer_hs[0, t]
             self._episode_buffer.append(h_t)
             self._episode_token_ids.append(input_ids[0, t].item())
             self._episode_token_count += 1
@@ -251,12 +267,10 @@ class CellMemWrapper:
             router_key = None
             episode_text = None
             if self._episode_token_count >= self.config.episode_size:
-                ep_hs = torch.stack(self._episode_buffer, dim=0)  # [episode_size, d_model]
-                # Cast to router dtype (float32) in case backbone uses bfloat16
+                ep_hs = torch.stack(self._episode_buffer, dim=0)
                 ep_hs = ep_hs.to(next(self.router.parameters()).dtype)
                 with torch.no_grad():
                     router_key = self.router.encode_episode(ep_hs)
-                # Attach full text only to the first episode of this write_memory() call
                 if not self._text_used:
                     episode_text = self._current_write_text
                     self._text_used = True
@@ -266,8 +280,35 @@ class CellMemWrapper:
                 self._episode_token_ids = []
                 self._episode_token_count = 0
 
+                # Store hidden states for this episode (all layers)
+                if hs_buf and router_key is not None:
+                    n_all = self.base_model.config.num_hidden_layers
+                    ep_start = len(written_token_indices) - self.config.episode_size
+                    ep_token_indices = written_token_indices[ep_start:]
+                    ep_hs_layers = []
+                    for l_idx in range(n_all):
+                        if l_idx in hs_buf:
+                            hs_l = hs_buf[l_idx][0, ep_token_indices]  # [ep_size, D]
+                        else:
+                            # Fallback: zeros (shouldn't happen with all-layer interceptor)
+                            hs_l = torch.zeros(
+                                len(ep_token_indices),
+                                self.base_model.config.hidden_size,
+                                device=self.device)
+                        ep_hs_layers.append(hs_l)
+                    ep_hs_tensor = torch.stack(ep_hs_layers, dim=0)  # [n_all, ep_size, D]
+                    # Will be stored after store.write sets episode_ptr
+                    self._pending_hs = ep_hs_tensor
+
             self.store.write(kv_dict, router_key, surprise=surprises[0, t].item(),
                             text=episode_text)
+
+            # Write pending hidden states to the episode that was just created
+            if hasattr(self, '_pending_hs') and self._pending_hs is not None:
+                ep_idx = (self.store.episode_ptr - 1) % (
+                    self.config.n_slots // self.config.episode_size)
+                self.store.write_hidden_states(ep_idx, self._pending_hs)
+                self._pending_hs = None
 
     def clear_memory(self):
         """Reset memory store."""
@@ -317,6 +358,114 @@ class CellMemWrapper:
     def _remove_hooks(hooks: list):
         for h in hooks:
             h.remove()
+
+    # --- Hidden State Injection (MemoryLLM-style) ---
+
+    def inject_memory_hs(self, query_text: str) -> list | None:
+        """Inject memory hidden states via decoder layer hooks.
+
+        For each layer, prepends memory hidden states to the input.
+        After attention, strips memory tokens from output.
+        Returns list of hooks (caller must remove), or None if no memory.
+        """
+        router_keys = self.store.get_router_keys()
+        if router_keys.shape[0] == 0:
+            return None
+
+        # Route query
+        q_inputs = self.tokenizer(query_text, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            q_out = self.base_model(**q_inputs, output_hidden_states=True)
+        first_hs_idx = min(self.layer_indices[0] + 1, len(q_out.hidden_states) - 1)
+        router_dtype = next(self.router.parameters()).dtype
+        h_q = q_out.hidden_states[first_hs_idx].to(router_dtype)
+        h_pooled = h_q.mean(dim=1, keepdim=True)
+        indices, scores = self.router.route(h_pooled, router_keys.to(self.device))
+        if indices.shape[-1] == 0:
+            return None
+        ep_indices = indices[0, 0, :].tolist()
+
+        # Read hidden states for selected episodes
+        mem_hs = self.store.read_hidden_states([int(i) for i in ep_indices])
+        if mem_hs is None:
+            return None
+        # mem_hs: [n_all_layers, n_mem_tokens, d_model]
+        mem_hs = mem_hs.to(self.device)
+        dtype = next(self.base_model.parameters()).dtype
+        mem_hs = mem_hs.to(dtype)
+        n_mem = mem_hs.shape[1]
+
+        # Install pre-hook (concat) and post-hook (strip) on each decoder layer
+        hooks = []
+        for layer_idx in range(self.base_model.config.num_hidden_layers):
+            layer = self.base_model.model.layers[layer_idx]
+            layer_mem = mem_hs[layer_idx].unsqueeze(0)  # [1, n_mem, d_model]
+
+            def make_pre_hook(mem_tokens, rotary_emb):
+                def hook(module, args, kwargs):
+                    # Get hidden_states from args or kwargs
+                    if 'hidden_states' in kwargs:
+                        hs = kwargs['hidden_states']
+                    else:
+                        hs = args[0]
+                        args = list(args)
+
+                    n_m = mem_tokens.shape[1]
+                    seq_len = hs.shape[1]
+                    total_len = n_m + seq_len
+
+                    # Concatenate memory before input
+                    combined = torch.cat([mem_tokens, hs], dim=1)
+
+                    # Extend attention_mask if present
+                    if 'attention_mask' in kwargs and kwargs['attention_mask'] is not None:
+                        mask = kwargs['attention_mask']
+                        if mask.dim() == 4:
+                            # Build new causal mask for extended sequence
+                            fill_val = False if mask.dtype == torch.bool else torch.finfo(mask.dtype).min
+                            allow_val = True if mask.dtype == torch.bool else 0
+                            new_mask = torch.full(
+                                (mask.shape[0], 1, total_len, total_len),
+                                fill_val, device=mask.device, dtype=mask.dtype)
+                            # All positions attend to memory (first n_m columns)
+                            new_mask[:, :, :, :n_m] = allow_val
+                            # Causal mask for query positions (lower triangle)
+                            for q in range(n_m, total_len):
+                                new_mask[:, :, q, n_m:q+1] = allow_val
+                            kwargs['attention_mask'] = new_mask
+
+                    # Recompute position_embeddings for extended sequence
+                    new_pos_ids = torch.arange(total_len, device=combined.device).unsqueeze(0)
+                    cos, sin = rotary_emb(combined, new_pos_ids)
+                    kwargs['position_embeddings'] = (cos, sin)
+
+                    if 'hidden_states' in kwargs:
+                        kwargs['hidden_states'] = combined
+                    else:
+                        args[0] = combined
+                        args = tuple(args)
+
+                    return args, kwargs
+                return hook
+
+            def make_post_hook(n_m):
+                def hook(module, args, kwargs, output):
+                    # Strip memory tokens from output
+                    # output is tuple: (hidden_states, ...) or just hidden_states
+                    if isinstance(output, tuple):
+                        hs = output[0]
+                        return (hs[:, n_m:],) + output[1:]
+                    return output[:, n_m:]
+                return hook
+
+            h1 = layer.register_forward_pre_hook(
+                make_pre_hook(layer_mem, self.base_model.model.rotary_emb),
+                with_kwargs=True)
+            h2 = layer.register_forward_hook(
+                make_post_hook(n_mem), with_kwargs=True)
+            hooks.extend([h1, h2])
+
+        return hooks
 
     # --- KV Cache Injection with Parallel RoPE ---
 
@@ -630,6 +779,41 @@ def compute_kv_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tens
     return torch.stack(losses).mean()
 
 
+def compute_hs_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tensor:
+    """LM loss with hidden state injection (MemoryLLM-style).
+
+    Model must use injected hidden states to predict answer.
+    Gradient flows through LoRA on all layers.
+    """
+    losses = []
+    for item in batch:
+        wrapper.clear_memory()
+        wrapper.write_memory(item["memory"])
+
+        q_text = f"Question: {item['query']}\nAnswer: {item['answer']}"
+        hooks = wrapper.inject_memory_hs(q_text)
+        prompt = wrapper._format_query_only(q_text)
+        inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+        targets = inputs["input_ids"].clone()
+
+        try:
+            with maybe_autocast(wrapper.device):
+                outputs = wrapper.base_model(input_ids=inputs["input_ids"])
+        finally:
+            if hooks:
+                wrapper._remove_hooks(hooks)
+
+        logits = outputs.logits
+        loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.shape[-1]),
+            targets[:, 1:].reshape(-1),
+        )
+        losses.append(loss)
+        wrapper.clear_memory()
+
+    return torch.stack(losses).mean()
+
+
 def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
     """Evaluate router recall and discrimination gap.
 
@@ -693,6 +877,7 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict],
         text_only: Text prefix injection only (baseline)
         kv_only:   KV cache injection only (no text in prompt)
         hybrid:    Text prefix + KV cache injection (MSA approach)
+        hs_only:   Hidden state injection only (MemoryLLM-style)
     """
     correct = 0
     n = min(20, len(data))
@@ -706,6 +891,23 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict],
 
         if mode == "hybrid":
             generated = wrapper.generate_with_memory(q_text, max_new_tokens=30)
+        elif mode == "hs_only":
+            # Hidden state injection with plain query (no text prefix)
+            hooks = wrapper.inject_memory_hs(q_text)
+            prompt = wrapper._format_query_only(q_text)
+            inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+            try:
+                with torch.no_grad():
+                    gen_ids = wrapper.base_model.generate(
+                        input_ids=inputs["input_ids"],
+                        max_new_tokens=30, do_sample=False,
+                        pad_token_id=wrapper.tokenizer.eos_token_id,
+                    )
+            finally:
+                if hooks:
+                    wrapper._remove_hooks(hooks)
+            answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
+            generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
         elif mode == "kv_only":
             # KV cache injection with plain query (no text prefix)
             mem_cache = wrapper.inject_memory_kv(q_text)
@@ -888,6 +1090,10 @@ def main():
     gen_hybrid = eval_generation(wrapper, eval_data, mode="hybrid", debug=True)
     print(f"  hybrid recall: {gen_hybrid['generation_recall']:.2%}")
 
+    print("\n--- hs_only (hidden state injection) ---")
+    gen_hs = eval_generation(wrapper, eval_data, mode="hs_only", debug=True)
+    print(f"  hs_only recall: {gen_hs['generation_recall']:.2%}")
+
     # Additional training if text_only baseline too low
     if gen_text["generation_recall"] < 0.75 and args.epochs2 > 0:
         print(f"\nText-only recall {gen_text['generation_recall']:.2%} < 75%, "
@@ -907,10 +1113,10 @@ def main():
     print(f"  kv_only_recall={gen_kv['generation_recall']:.2%} (target >=50%)")
     print(f"  hybrid_recall={gen_hybrid['generation_recall']:.2%} (target >=85%)")
 
-    # Phase 3: LoRA training on memory layers (teach attention to read memory K/V)
+    # Phase 3: LoRA training on ALL layers (teach attention to read memory hidden states)
     if args.lora_epochs > 0:
-        print(f"\n=== Phase 3: LoRA training (rank={args.lora_rank}, {args.lora_epochs} epochs) ===")
-        wrapper.install_memory_lora(rank=args.lora_rank)
+        print(f"\n=== Phase 3: LoRA + HS injection (rank={args.lora_rank}, {args.lora_epochs} epochs) ===")
+        wrapper.install_memory_lora(rank=args.lora_rank, all_layers=True)
         lora_params = sum(p.numel() for p in wrapper.trainable_params()
                          if p.requires_grad)
         print(f"  Trainable params: {lora_params:,} (router + LoRA)")
@@ -925,7 +1131,7 @@ def main():
                 if len(batch) < 2:
                     continue
                 optimizer.zero_grad()
-                loss = compute_kv_lm_loss(wrapper, batch)
+                loss = compute_hs_lm_loss(wrapper, batch)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(wrapper.trainable_params(), 1.0)
                 optimizer.step()
@@ -935,13 +1141,9 @@ def main():
             print(f"[p3-lora] epoch {epoch+1}/{args.lora_epochs} | kv_lm_loss={avg:.4f}")
 
         # Eval after LoRA training
-        print("\n--- kv_only after LoRA ---")
-        gen_kv_lora = eval_generation(wrapper, eval_data, mode="kv_only", debug=True)
-        print(f"  kv_only recall (with LoRA): {gen_kv_lora['generation_recall']:.2%}")
-
-        print("\n--- hybrid after LoRA ---")
-        gen_hybrid_lora = eval_generation(wrapper, eval_data, mode="hybrid", debug=True)
-        print(f"  hybrid recall (with LoRA): {gen_hybrid_lora['generation_recall']:.2%}")
+        print("\n--- hs_only after LoRA ---")
+        gen_hs_lora = eval_generation(wrapper, eval_data, mode="hs_only", debug=True)
+        print(f"  hs_only recall (with LoRA): {gen_hs_lora['generation_recall']:.2%}")
 
         if ckpt_dir:
             # Save LoRA state

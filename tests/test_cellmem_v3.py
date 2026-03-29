@@ -558,6 +558,50 @@ class TestIntegrationSmoke:
             assert hasattr(attn, '_original_q_proj'), f"Layer {layer_idx} should have LoRA installed"
         wrapper.remove_memory_lora()
 
+    # --- Hidden State Injection (MemoryLLM-style) ---
+
+    def test_write_memory_captures_hidden_states(self, wrapper):
+        """write_memory should capture per-layer hidden states."""
+        wrapper.clear_memory()
+        wrapper.write_memory(
+            "Dr. Elena Voss discovered Pyrothene in 2031 at CERN in Geneva Switzerland. "
+            "This was a breakthrough in particle physics that changed everything we know."
+        )
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        # Check hidden states were captured
+        hs = wrapper.store.read_hidden_states(list(range(wrapper.store.active_episodes)))
+        assert hs is not None, "Hidden states should be stored"
+        n_total_layers = wrapper.base_model.config.num_hidden_layers
+        assert hs.shape[0] == n_total_layers, "Should have hidden states for all layers"
+        assert hs.shape[2] == wrapper.base_model.config.hidden_size, "Wrong hidden dim"
+
+    def test_inject_memory_hs_changes_logits(self, wrapper):
+        """Hidden state injection via layer hooks should change logits."""
+        wrapper.clear_memory()
+        wrapper.write_memory(
+            "Pyrothene was discovered in 2031 at CERN by Dr. Elena Voss in Switzerland. "
+            "This was a major breakthrough that revolutionized particle physics completely."
+        )
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        inputs = wrapper.tokenizer("What is Pyrothene?", return_tensors="pt").to(wrapper.device)
+        with torch.no_grad():
+            out_base = wrapper.base_model(input_ids=inputs["input_ids"]).logits.clone()
+
+        # Inject hidden states via hooks
+        hooks = wrapper.inject_memory_hs("What is Pyrothene?")
+        if hooks is None:
+            pytest.skip("No memory to inject")
+        try:
+            with torch.no_grad():
+                out_mem = wrapper.base_model(input_ids=inputs["input_ids"]).logits
+        finally:
+            wrapper._remove_hooks(hooks)
+
+        assert not torch.allclose(out_base, out_mem, atol=1e-3), \
+            "Hidden state injection should change logits"
+
     def test_lora_changes_kv_injection_logits(self, wrapper):
         """With LoRA installed, KV injection should produce different logits than without."""
         wrapper.clear_memory()

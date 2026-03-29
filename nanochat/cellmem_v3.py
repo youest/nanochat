@@ -133,6 +133,9 @@ class MemoryStore:
 
         self.keys = torch.zeros(n_layers, N, n_kv_heads, d_head)
         self.values = torch.zeros(n_layers, N, n_kv_heads, d_head)
+        # Hidden states storage (for MemoryLLM-style injection)
+        # Stored per-token across ALL model layers, not just router layers
+        self._hidden_states: list[torch.Tensor | None] = [None] * E  # per episode
         self.router_keys = torch.zeros(E, config.router_dim)
         self.episode_texts: list[str | None] = [None] * E
         self.surprise = torch.zeros(N)
@@ -196,6 +199,30 @@ class MemoryStore:
                 ep_idx = self.active_episodes - 1  # overwrite last
             self.router_keys[ep_idx] = router_key.detach()
             self.episode_texts[ep_idx] = text
+
+    def write_hidden_states(self, episode_idx: int, hidden_states: torch.Tensor):
+        """Store hidden states for an episode.
+
+        Args:
+            episode_idx: episode index
+            hidden_states: [n_all_layers, n_tokens, d_model]
+        """
+        if episode_idx < len(self._hidden_states):
+            self._hidden_states[episode_idx] = hidden_states.detach().cpu()
+
+    def read_hidden_states(self, episode_indices: list[int]) -> torch.Tensor | None:
+        """Read and concatenate hidden states for selected episodes.
+
+        Returns:
+            [n_all_layers, total_tokens, d_model] or None if no hidden states stored.
+        """
+        hs_list = []
+        for i in episode_indices:
+            if i < len(self._hidden_states) and self._hidden_states[i] is not None:
+                hs_list.append(self._hidden_states[i])
+        if not hs_list:
+            return None
+        return torch.cat(hs_list, dim=1)  # concat on token dim
 
     def read_texts(self, episode_indices: list[int]) -> list[str]:
         """Return non-None texts for the given episode indices."""
