@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
@@ -23,6 +24,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from nanochat.cellmem_v3 import CellMemConfig, MemoryRouter, MemoryStore
 from nanochat.cellmem_v2 import SurpriseCalculator
 from nanochat.kv_interceptor import KVInterceptor
+
+
+# ---------------------------------------------------------------------------
+# LoRA adapter for memory-layer attention
+# ---------------------------------------------------------------------------
+
+class LoRALinear(nn.Module):
+    """Low-rank adapter: output = base(x) + scale * B @ A @ x"""
+    def __init__(self, base: nn.Linear, rank: int = 4, scale: float = 1.0):
+        super().__init__()
+        self.base = base
+        self.lora_A = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, base.out_features, bias=False)
+        self.scale = scale
+        # Init: A normal, B small random (NOT zero — zero blocks gradient to A)
+        nn.init.normal_(self.lora_A.weight, std=0.02)
+        nn.init.normal_(self.lora_B.weight, std=1e-3)
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        return self.base(x) + self.scale * self.lora_B(self.lora_A(x))
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +133,35 @@ class CellMemWrapper:
             p.requires_grad_(False)
 
     def trainable_params(self):
-        return list(self.router.parameters())
+        params = list(self.router.parameters())
+        # Add LoRA params if installed
+        for layer_idx in self.layer_indices:
+            attn = self.base_model.model.layers[layer_idx].self_attn
+            if hasattr(attn, '_original_q_proj'):
+                lora = attn.q_proj
+                params.extend(lora.lora_A.parameters())
+                params.extend(lora.lora_B.parameters())
+        return params
+
+    def install_memory_lora(self, rank: int = 8, scale: float = 1.0):
+        """Install LoRA on q_proj of memory layers to learn to attend to memory K/V."""
+        for layer_idx in self.layer_indices:
+            attn = self.base_model.model.layers[layer_idx].self_attn
+            if hasattr(attn, '_original_q_proj'):
+                continue  # Already installed
+            original = attn.q_proj
+            dtype = next(self.base_model.parameters()).dtype
+            lora = LoRALinear(original, rank=rank, scale=scale).to(device=self.device, dtype=dtype)
+            attn._original_q_proj = original
+            attn.q_proj = lora
+
+    def remove_memory_lora(self):
+        """Remove LoRA from memory layers, restoring original q_proj."""
+        for layer_idx in self.layer_indices:
+            attn = self.base_model.model.layers[layer_idx].self_attn
+            if hasattr(attn, '_original_q_proj'):
+                attn.q_proj = attn._original_q_proj
+                del attn._original_q_proj
 
     def _is_text_redundant(self, text: str, threshold: float = 0.7) -> bool:
         """Check if text is too similar to an already stored episode text."""
@@ -530,6 +581,55 @@ def compute_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tensor:
     return torch.stack(losses).mean()
 
 
+def compute_kv_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tensor:
+    """LM loss with KV injection: model must use injected K/V to predict answer.
+
+    No text prefix — the model can only access memory through the injected K/V.
+    Gradient flows through LoRA on q_proj of memory layers.
+    """
+    losses = []
+    for item in batch:
+        wrapper.clear_memory()
+        wrapper.write_memory(item["memory"])
+
+        # KV injection (no text prefix)
+        q_text = f"Question: {item['query']}\nAnswer: {item['answer']}"
+        mem_cache = wrapper.inject_memory_kv(q_text)
+        prompt = wrapper._format_query_only(q_text)
+        inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+        targets = inputs["input_ids"].clone()
+
+        if mem_cache is not None:
+            n_mem = mem_cache.get_seq_length()
+            seq_len = inputs["input_ids"].shape[1]
+            attn_mask = torch.ones(1, n_mem + seq_len, device=wrapper.device, dtype=torch.long)
+            pos_ids = torch.arange(n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
+            hooks = wrapper._install_memory_mask_hooks(n_mem)
+            try:
+                with maybe_autocast(wrapper.device):
+                    outputs = wrapper.base_model(
+                        input_ids=inputs["input_ids"],
+                        past_key_values=mem_cache,
+                        attention_mask=attn_mask,
+                        position_ids=pos_ids,
+                    )
+            finally:
+                wrapper._remove_hooks(hooks)
+        else:
+            with maybe_autocast(wrapper.device):
+                outputs = wrapper.base_model(**inputs)
+
+        logits = outputs.logits
+        loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.shape[-1]),
+            targets[:, 1:].reshape(-1),
+        )
+        losses.append(loss)
+        wrapper.clear_memory()
+
+    return torch.stack(losses).mean()
+
+
 def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
     """Evaluate router recall and discrimination gap.
 
@@ -718,6 +818,10 @@ def main():
                         help="Directory to save router checkpoints after each phase")
     parser.add_argument("--resume-phase2", default=None, metavar="CKPT",
                         help="Skip Phase 1 and load router checkpoint, then run Phase 2")
+    parser.add_argument("--lora-rank", type=int, default=8,
+                        help="LoRA rank for memory layer q_proj")
+    parser.add_argument("--lora-epochs", type=int, default=10,
+                        help="Number of epochs for LoRA training (Phase 3)")
     args = parser.parse_args()
 
     print(f"Loading {args.model} on {args.device}...")
@@ -802,6 +906,55 @@ def main():
     print(f"  text_only_recall={gen_text['generation_recall']:.2%} (baseline)")
     print(f"  kv_only_recall={gen_kv['generation_recall']:.2%} (target >=50%)")
     print(f"  hybrid_recall={gen_hybrid['generation_recall']:.2%} (target >=85%)")
+
+    # Phase 3: LoRA training on memory layers (teach attention to read memory K/V)
+    if args.lora_epochs > 0:
+        print(f"\n=== Phase 3: LoRA training (rank={args.lora_rank}, {args.lora_epochs} epochs) ===")
+        wrapper.install_memory_lora(rank=args.lora_rank)
+        lora_params = sum(p.numel() for p in wrapper.trainable_params()
+                         if p.requires_grad)
+        print(f"  Trainable params: {lora_params:,} (router + LoRA)")
+
+        optimizer = torch.optim.AdamW(wrapper.trainable_params(), lr=args.lr * 0.1)
+        for epoch in range(args.lora_epochs):
+            random.shuffle(train_data)
+            total_loss = 0.0
+            n_batches = 0
+            for i in range(0, len(train_data), args.batch_size):
+                batch = train_data[i:i + args.batch_size]
+                if len(batch) < 2:
+                    continue
+                optimizer.zero_grad()
+                loss = compute_kv_lm_loss(wrapper, batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(wrapper.trainable_params(), 1.0)
+                optimizer.step()
+                total_loss += loss.item()
+                n_batches += 1
+            avg = total_loss / max(n_batches, 1)
+            print(f"[p3-lora] epoch {epoch+1}/{args.lora_epochs} | kv_lm_loss={avg:.4f}")
+
+        # Eval after LoRA training
+        print("\n--- kv_only after LoRA ---")
+        gen_kv_lora = eval_generation(wrapper, eval_data, mode="kv_only", debug=True)
+        print(f"  kv_only recall (with LoRA): {gen_kv_lora['generation_recall']:.2%}")
+
+        print("\n--- hybrid after LoRA ---")
+        gen_hybrid_lora = eval_generation(wrapper, eval_data, mode="hybrid", debug=True)
+        print(f"  hybrid recall (with LoRA): {gen_hybrid_lora['generation_recall']:.2%}")
+
+        if ckpt_dir:
+            # Save LoRA state
+            lora_state = {}
+            for layer_idx in wrapper.layer_indices:
+                attn = wrapper.base_model.model.layers[layer_idx].self_attn
+                if hasattr(attn, '_original_q_proj'):
+                    lora = attn.q_proj
+                    lora_state[f"layer_{layer_idx}_lora_A"] = lora.lora_A.state_dict()
+                    lora_state[f"layer_{layer_idx}_lora_B"] = lora.lora_B.state_dict()
+            lora_path = ckpt_dir / "lora_final.pt"
+            torch.save(lora_state, lora_path)
+            print(f"LoRA checkpoint saved: {lora_path}")
 
     if ckpt_dir:
         final_path = ckpt_dir / "router_final.pt"

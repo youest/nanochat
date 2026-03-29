@@ -543,3 +543,58 @@ class TestIntegrationSmoke:
         result = wrapper.generate_with_memory("What did Dr. Voss discover?", max_new_tokens=20)
         assert isinstance(result, str)
         assert len(result) > 0
+
+    # --- LoRA on memory layers ---
+
+    def test_install_lora_adds_trainable_params(self, wrapper):
+        """install_memory_lora() should add trainable LoRA params on q_proj of memory layers."""
+        before_params = sum(p.numel() for p in wrapper.trainable_params())
+        wrapper.install_memory_lora(rank=8)
+        after_params = sum(p.numel() for p in wrapper.trainable_params())
+        assert after_params > before_params, "LoRA should add trainable parameters"
+        # Verify LoRA is on q_proj of memory layers
+        for layer_idx in wrapper.layer_indices:
+            attn = wrapper.base_model.model.layers[layer_idx].self_attn
+            assert hasattr(attn, '_original_q_proj'), f"Layer {layer_idx} should have LoRA installed"
+        wrapper.remove_memory_lora()
+
+    def test_lora_changes_kv_injection_logits(self, wrapper):
+        """With LoRA installed, KV injection should produce different logits than without."""
+        wrapper.clear_memory()
+        wrapper.write_memory(
+            "Dr. Elena Voss discovered Pyrothene in 2031 at CERN in Geneva Switzerland. "
+            "This was a breakthrough in particle physics that changed everything we know."
+        )
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+
+        # Logits WITHOUT LoRA
+        cache1 = wrapper.inject_memory_kv("What is Pyrothene?")
+        inputs = wrapper.tokenizer("What is Pyrothene?", return_tensors="pt").to(wrapper.device)
+        n_mem = cache1.get_seq_length()
+        seq_len = inputs["input_ids"].shape[1]
+        attn_mask = torch.ones(1, n_mem + seq_len, device=wrapper.device, dtype=torch.long)
+        pos_ids = torch.arange(n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
+        hooks1 = wrapper._install_memory_mask_hooks(n_mem)
+        with torch.no_grad():
+            out1 = wrapper.base_model(
+                input_ids=inputs["input_ids"], past_key_values=cache1,
+                attention_mask=attn_mask, position_ids=pos_ids,
+            ).logits.clone()
+        wrapper._remove_hooks(hooks1)
+
+        # Install LoRA and get logits again
+        wrapper.install_memory_lora(rank=8)
+        cache2 = wrapper.inject_memory_kv("What is Pyrothene?")
+        hooks2 = wrapper._install_memory_mask_hooks(n_mem)
+        with torch.no_grad():
+            out2 = wrapper.base_model(
+                input_ids=inputs["input_ids"], past_key_values=cache2,
+                attention_mask=attn_mask, position_ids=pos_ids,
+            ).logits
+        wrapper._remove_hooks(hooks2)
+        wrapper.remove_memory_lora()
+
+        # LoRA should change logits (even with random init)
+        assert not torch.allclose(out1, out2, atol=1e-3), \
+            "LoRA should change logits for memory layer attention"
