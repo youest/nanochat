@@ -410,6 +410,11 @@ class CellMemWrapper:
                         hs = args[0]
                         args = list(args)
 
+                    # Skip during autoregressive generation (1 token at a time)
+                    # Memory influence persists through KV cache from prefill
+                    if hs.shape[1] <= 1:
+                        return args, kwargs
+
                     n_m = mem_tokens.shape[1]
                     seq_len = hs.shape[1]
                     total_len = n_m + seq_len
@@ -451,11 +456,15 @@ class CellMemWrapper:
             def make_post_hook(n_m):
                 def hook(module, args, kwargs, output):
                     # Strip memory tokens from output
-                    # output is tuple: (hidden_states, ...) or just hidden_states
                     if isinstance(output, tuple):
                         hs = output[0]
-                        return (hs[:, n_m:],) + output[1:]
-                    return output[:, n_m:]
+                        # Only strip if we actually injected (prefill, not generation)
+                        if hs.shape[1] > n_m:
+                            return (hs[:, n_m:],) + output[1:]
+                        return output
+                    if output.shape[1] > n_m:
+                        return output[:, n_m:]
+                    return output
                 return hook
 
             h1 = layer.register_forward_pre_hook(
