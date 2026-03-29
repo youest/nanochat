@@ -39,7 +39,7 @@ file_mounts:
 envs:
   S3_BUCKET: "s3://nanoy-checks-youest"
   S3_REGION: "eu-south-1"
-  MODEL: "Qwen/Qwen3-4B"
+  MODEL: "Qwen/Qwen3-4B-Instruct"
   EPOCHS1: "20"
   EPOCHS2: "30"
   BATCH_SIZE: "8"

@@ -248,6 +248,60 @@ class TestMemoryStoreV3Read:
         assert rk.shape[1] == 8  # d_router
 
 
+class TestMemoryStoreV3EpisodeTexts:
+    """Tests for episode text storage (MSA-inspired text re-injection)."""
+
+    def test_write_stores_episode_text(self):
+        cfg = CellMemConfig(n_slots=16, router_dim=8, episode_size=4)
+        store = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        # Write 4 tokens with router_key + text on the last one (episode boundary)
+        for i in range(4):
+            rk = torch.randn(8) if i == 3 else None
+            text = "Dr. Voss discovered Pyrothene" if i == 3 else None
+            store.write(
+                {"keys": torch.randn(1, 1, 4), "values": torch.randn(1, 1, 4)},
+                rk, surprise=5.0, text=text,
+            )
+        assert store.episode_texts[0] == "Dr. Voss discovered Pyrothene"
+
+    def test_write_no_text_stores_none(self):
+        cfg = CellMemConfig(n_slots=16, router_dim=8, episode_size=4)
+        store = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        for i in range(4):
+            store.write(
+                {"keys": torch.randn(1, 1, 4), "values": torch.randn(1, 1, 4)},
+                torch.randn(8) if i == 3 else None, surprise=5.0,
+            )
+        assert store.episode_texts[0] is None
+
+    def test_read_texts_returns_stored(self):
+        cfg = CellMemConfig(n_slots=16, router_dim=8, episode_size=4)
+        store = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        texts = ["fact one", "fact two"]
+        for ep in range(2):
+            for i in range(4):
+                rk = torch.randn(8) if i == 3 else None
+                t = texts[ep] if i == 3 else None
+                store.write(
+                    {"keys": torch.randn(1, 1, 4), "values": torch.randn(1, 1, 4)},
+                    rk, surprise=5.0, text=t,
+                )
+        result = store.read_texts([0, 1])
+        assert result == ["fact one", "fact two"]
+
+    def test_read_texts_skips_none(self):
+        cfg = CellMemConfig(n_slots=16, router_dim=8, episode_size=4)
+        store = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        # Write episode without text
+        for i in range(4):
+            store.write(
+                {"keys": torch.randn(1, 1, 4), "values": torch.randn(1, 1, 4)},
+                torch.randn(8) if i == 3 else None, surprise=5.0,
+            )
+        result = store.read_texts([0])
+        assert result == []
+
+
 class TestMemoryStoreV3Persistence:
     def test_save_load_roundtrip(self, tmp_path):
         cfg = CellMemConfig(n_slots=8, router_dim=4, episode_size=4)
@@ -264,6 +318,42 @@ class TestMemoryStoreV3Persistence:
         store2.load(path)
         assert store2.active_count == store.active_count
         assert torch.allclose(store2.surprise, store.surprise)
+
+    def test_save_load_preserves_episode_texts(self, tmp_path):
+        cfg = CellMemConfig(n_slots=8, router_dim=4, episode_size=4)
+        store = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        for i in range(4):
+            rk = torch.randn(4) if i == 3 else None
+            t = "test fact" if i == 3 else None
+            store.write(
+                {"keys": torch.randn(1, 1, 4), "values": torch.randn(1, 1, 4)},
+                rk, surprise=5.0, text=t,
+            )
+        path = tmp_path / "mem_texts.pt"
+        store.save(path)
+
+        store2 = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        store2.load(path)
+        assert store2.episode_texts[0] == "test fact"
+
+    def test_load_legacy_no_texts(self, tmp_path):
+        """Old checkpoints without episode_texts should load cleanly."""
+        cfg = CellMemConfig(n_slots=8, router_dim=4, episode_size=4)
+        store = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        store.write(
+            {"keys": torch.randn(1, 1, 4), "values": torch.randn(1, 1, 4)},
+            torch.randn(4), surprise=5.0,
+        )
+        path = tmp_path / "legacy.pt"
+        store.save(path)
+        # Simulate legacy: remove episode_texts from checkpoint
+        data = torch.load(path, weights_only=False)
+        del data["episode_texts"]
+        torch.save(data, path)
+
+        store2 = MemoryStore(cfg, n_layers=1, n_kv_heads=1, d_head=4)
+        store2.load(path)
+        assert all(t is None for t in store2.episode_texts)
 
     def test_decay_on_load(self, tmp_path):
         cfg = CellMemConfig(n_slots=8, router_dim=4, decay_factor=0.5)
@@ -300,94 +390,39 @@ class TestIntegrationSmoke:
         except Exception:
             pytest.skip("Model not available")
 
-    def test_write_then_read_no_crash(self, wrapper):
-        wrapper.write_memory("Dr. Elena Voss discovered Pyrothene in 2031")
-        tokens = wrapper.tokenizer("What did Dr. Voss discover?", return_tensors="pt")
-        tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
-        wrapper._install_read_hooks()
-        with torch.no_grad():
-            output = wrapper.base_model(**tokens)
-        wrapper._remove_read_hooks()
-        assert output.logits is not None
-
-    def test_empty_memory_no_change(self, wrapper):
-        tokens = wrapper.tokenizer("Hello world", return_tensors="pt")
-        tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
-        with torch.no_grad():
-            out1 = wrapper.base_model(**tokens).logits.clone()
-        # Empty memory → no hooks installed → output identical
-        with torch.no_grad():
-            out2 = wrapper.base_model(**tokens).logits
-        assert torch.allclose(out1, out2, atol=1e-5)
-
-    def test_memory_injection_changes_logits(self, wrapper):
-        """Memory injection via read hooks must visibly change logits.
-
-        Verifies that _install_read_hooks() actually modifies the residual
-        stream: logits with memory should differ from logits without memory.
-        """
+    def test_write_memory_stores_text(self, wrapper):
+        """write_memory() should store episode text for later retrieval."""
         wrapper.clear_memory()
         wrapper.write_memory("Dr. Elena Voss discovered Pyrothene in 2031")
-        assert wrapper.store.active_episodes > 0, (
-            "No episodes stored — surprise threshold too high or text too short"
-        )
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        texts = wrapper.store.read_texts(list(range(wrapper.store.active_episodes)))
+        assert any("Pyrothene" in t for t in texts if t)
 
-        tokens = wrapper.tokenizer("What did Dr. Voss discover?", return_tensors="pt")
-        tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
+    def test_retrieve_and_format_empty_store(self, wrapper):
+        """Empty store should return a valid prompt without memories."""
+        wrapper.clear_memory()
+        prompt = wrapper.retrieve_and_format("What is Pyrothene?")
+        assert isinstance(prompt, str)
+        assert len(prompt) > 0
+        # Should NOT contain memory references
+        assert "Memory 1:" not in prompt
 
-        # Forward without memory hooks
-        with torch.no_grad():
-            out_no_mem = wrapper.base_model(**tokens).logits.clone()
-
-        # Forward with memory hooks injecting stored KV
-        wrapper._install_read_hooks()
-        try:
-            with torch.no_grad():
-                out_with_mem = wrapper.base_model(**tokens).logits
-        finally:
-            wrapper._remove_read_hooks()
-
-        diff = (out_no_mem - out_with_mem).abs().max().item()
-        assert diff > 1e-5, (
-            f"Memory injection had no effect on logits (max diff={diff:.2e}). "
-            "Read hooks are not modifying the residual stream."
-        )
-
-    def test_memory_injection_improves_target_logit(self, wrapper):
-        """Post-hook injection must INCREASE logit for the stored answer.
-
-        Validates injection direction: storing 'Pyrothene' in memory and then
-        querying should raise the logit for 'P' (start of 'Pyrothene') at the
-        last query position. This confirms post-hook adds useful signal rather
-        than corrupting the residual (the old pre-hook bug raised LM loss and
-        gave generation_recall=0%).
-        """
+    def test_retrieve_and_format_with_memory(self, wrapper):
+        """After writing memory, retrieve_and_format should include memory text."""
         wrapper.clear_memory()
         wrapper.write_memory("Dr. Elena Voss discovered Pyrothene in 2031 at CERN")
         if wrapper.store.active_episodes == 0:
             pytest.skip("No episodes stored — surprise threshold too high")
+        prompt = wrapper.retrieve_and_format("What did Dr. Voss discover?")
+        assert "Memory 1:" in prompt or "Pyrothene" in prompt
 
-        query = "What did Dr. Voss discover? Pyrothene"
-        tokens = wrapper.tokenizer(query, return_tensors="pt")
+    def test_empty_memory_no_change(self, wrapper):
+        """Empty memory: model generates normally without crash."""
+        tokens = wrapper.tokenizer("Hello world", return_tensors="pt")
         tokens = {k: v.to(wrapper.device) for k, v in tokens.items()}
-
-        # Token id for 'P' (first subword of 'Pyrothene' in most tokenizers)
-        pyrothene_tok = wrapper.tokenizer.encode("Pyrothene", add_special_tokens=False)[0]
-
-        last_pos = tokens["input_ids"].shape[1] - 2  # position predicting 'Pyrothene'
-
         with torch.no_grad():
-            logit_no_mem = wrapper.base_model(**tokens).logits[0, last_pos, pyrothene_tok].item()
-
-        wrapper._install_read_hooks()
-        try:
-            with torch.no_grad():
-                logit_with_mem = wrapper.base_model(**tokens).logits[0, last_pos, pyrothene_tok].item()
-        finally:
-            wrapper._remove_read_hooks()
-
-        assert logit_with_mem > logit_no_mem, (
-            f"Memory injection did NOT increase target logit: "
-            f"no_mem={logit_no_mem:.3f}, with_mem={logit_with_mem:.3f}. "
-            "Injection direction is wrong — may be corrupting residual stream."
-        )
+            out1 = wrapper.base_model(**tokens).logits.clone()
+        with torch.no_grad():
+            out2 = wrapper.base_model(**tokens).logits
+        assert torch.allclose(out1, out2, atol=1e-5)

@@ -100,9 +100,9 @@ class CellMemWrapper:
 
         self.surprise_calc = SurpriseCalculator(self.config)
         self.interceptor = KVInterceptor(model, layer_indices, model_type="qwen")
-        self._read_hooks: list = []
         self._episode_buffer: list = []  # hidden states for current episode
         self._episode_token_count = 0
+        self._current_write_text: str | None = None
 
         # Freeze backbone
         for p in model.parameters():
@@ -111,108 +111,9 @@ class CellMemWrapper:
     def trainable_params(self):
         return list(self.router.parameters())
 
-    def _install_read_hooks(self):
-        """Install hooks that inject memory into the residual stream during forward.
-
-        Uses paired pre+post hooks: pre-hook captures normed_h (unmodified) so
-        that post-hook can compute memory cross-attention and add it directly to
-        the self_attn OUTPUT (before the layer residual connection). This avoids
-        corrupting q_proj/k_proj/v_proj inputs, which caused LM loss to spike
-        when injecting into the pre-hook input (pre-hook bug: α=1.0 into normed_h
-        disrupted all downstream attention projections).
-        """
-        ALPHA = 1.0  # post-hook is safe at higher alpha (backbone self_attn runs clean)
-        self._remove_read_hooks()
-        for layer_pos, layer_idx in enumerate(self.layer_indices):
-            attn = self.base_model.model.layers[layer_idx].self_attn
-            normed_h_buf = [None]  # shared buffer between pre and post hook
-
-            def make_hooks(lpos, buf):
-                def pre_hook(module, args, kwargs):
-                    # Capture normed hidden_states WITHOUT modifying them
-                    if 'hidden_states' in kwargs:
-                        buf[0] = kwargs['hidden_states']
-                    elif isinstance(args, tuple) and len(args) > 0:
-                        buf[0] = args[0]
-                    else:
-                        buf[0] = None
-                    return args, kwargs  # pass through unmodified
-
-                def post_hook(module, input, output):
-                    normed_h = buf[0]
-                    buf[0] = None  # clear for next call
-                    if normed_h is None:
-                        return output
-
-                    router_keys = self.store.get_router_keys()
-                    if router_keys.shape[0] == 0:
-                        return output
-
-                    router_keys = router_keys.to(self.device)
-                    router_dtype = next(self.router.parameters()).dtype
-                    # Mean-pool over time dim: router was trained on mean-pooled
-                    # query reps, so inference must match. Using indices[0,0,:]
-                    # (first token only) caused wrong episode selection despite
-                    # 100% router_recall on the mean-pooled eval.
-                    h_pooled = normed_h.mean(dim=1, keepdim=True)  # [B, 1, D]
-                    indices, scores = self.router.route(
-                        h_pooled.to(router_dtype), router_keys
-                    )
-                    if indices.shape[-1] == 0:
-                        return output
-
-                    ep_indices = indices[0, 0, :].tolist()
-                    result = self.store.read([int(i) for i in ep_indices])
-                    if result is None:
-                        return output
-
-                    k_mem, v_mem = result  # [n_layers, n_tokens, n_kv_heads, d_head]
-                    k_layer = k_mem[lpos].to(self.device)
-                    v_layer = v_mem[lpos].to(self.device)
-
-                    B, T, D = normed_h.shape
-                    q = module.q_proj(normed_h)  # [B, T, n_heads * d_head]
-
-                    n_heads = self.base_model.config.num_attention_heads
-                    n_kv_heads_cfg = self.base_model.config.num_key_value_heads
-                    d_head = self._d_head
-
-                    q = q.view(B, T, n_heads, d_head).transpose(1, 2)
-
-                    k_m = k_layer.unsqueeze(0).expand(B, -1, -1, -1).permute(0, 2, 1, 3)
-                    v_m = v_layer.unsqueeze(0).expand(B, -1, -1, -1).permute(0, 2, 1, 3)
-
-                    if n_kv_heads_cfg < n_heads:
-                        repeat = n_heads // n_kv_heads_cfg
-                        k_m = k_m.repeat_interleave(repeat, dim=1)
-                        v_m = v_m.repeat_interleave(repeat, dim=1)
-
-                    k_m = k_m.to(normed_h.dtype)
-                    v_m = v_m.to(normed_h.dtype)
-
-                    mem_attn = F.scaled_dot_product_attention(q, k_m, v_m)
-                    mem_attn = mem_attn.transpose(1, 2).reshape(B, T, n_heads * d_head)
-                    mem_attn = module.o_proj(mem_attn)  # [B, T, D]
-
-                    # Inject into self_attn OUTPUT (before layer residual), not into normed_h
-                    if isinstance(output, tuple):
-                        return (output[0] + ALPHA * mem_attn,) + output[1:]
-                    return output + ALPHA * mem_attn
-
-                return pre_hook, post_hook
-
-            pre, post = make_hooks(layer_pos, normed_h_buf)
-            h1 = attn.register_forward_pre_hook(pre, with_kwargs=True)
-            h2 = attn.register_forward_hook(post)
-            self._read_hooks.extend([h1, h2])
-
-    def _remove_read_hooks(self):
-        for h in self._read_hooks:
-            h.remove()
-        self._read_hooks.clear()
-
     def write_memory(self, text: str):
         """Process text and write surprising tokens to memory store."""
+        self._current_write_text = text
         inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
         input_ids = inputs["input_ids"]  # [1, T]
         T = input_ids.shape[1]
@@ -284,7 +185,8 @@ class CellMemWrapper:
                 self._episode_buffer = []
                 self._episode_token_count = 0
 
-            self.store.write(kv_dict, router_key, surprise=surprises[0, t].item())
+            self.store.write(kv_dict, router_key, surprise=surprises[0, t].item(),
+                            text=self._current_write_text if router_key is not None else None)
 
     def clear_memory(self):
         """Reset memory store."""
@@ -293,6 +195,57 @@ class CellMemWrapper:
         self.store = MemoryStore(cfg, len(self.layer_indices), n_kv, self._d_head)
         self._episode_buffer = []
         self._episode_token_count = 0
+        self._current_write_text = None
+
+    # --- Text prefix injection (MSA-inspired) ---
+
+    def retrieve_and_format(self, query_text: str) -> str:
+        """Route query through router, retrieve memory texts, format prompt."""
+        router_keys = self.store.get_router_keys()
+        if router_keys.shape[0] == 0:
+            return self._format_query_only(query_text)
+
+        # Get hidden states for routing
+        q_inputs = self.tokenizer(query_text, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            q_out = self.base_model(**q_inputs, output_hidden_states=True)
+        first_hs_idx = min(self.layer_indices[0] + 1, len(q_out.hidden_states) - 1)
+        router_dtype = next(self.router.parameters()).dtype
+        h_q = q_out.hidden_states[first_hs_idx].to(router_dtype)  # [1, T, D]
+        h_pooled = h_q.mean(dim=1, keepdim=True)  # [1, 1, D]
+
+        indices, scores = self.router.route(h_pooled, router_keys.to(self.device))
+        if indices.shape[-1] == 0:
+            return self._format_query_only(query_text)
+
+        ep_indices = indices[0, 0, :].tolist()
+        texts = self.store.read_texts([int(i) for i in ep_indices])
+        if not texts:
+            return self._format_query_only(query_text)
+
+        return self._format_with_memories(query_text, texts)
+
+    def _format_with_memories(self, query_text: str, memory_texts: list[str]) -> str:
+        """Format prompt with memories in system prompt (instruct chat template)."""
+        system_parts = ["You have access to memories. Use them to answer accurately."]
+        for i, text in enumerate(memory_texts, 1):
+            system_parts.append(f"Memory {i}: {text}")
+        system_msg = "\n".join(system_parts)
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": query_text},
+        ]
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+    def _format_query_only(self, query_text: str) -> str:
+        """Format prompt without memories."""
+        messages = [{"role": "user", "content": query_text}]
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -354,16 +307,16 @@ def maybe_autocast(device: str):
 
 
 def compute_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tensor:
-    """Language model loss: write memory, then predict answer given query."""
+    """Language model loss: write memory, retrieve text, predict answer."""
     losses = []
-    wrapper._install_read_hooks()
     for item in batch:
         wrapper.clear_memory()
         wrapper.write_memory(item["memory"])
 
-        # Query + answer as target (same Q&A format used in eval_generation)
-        full_text = f"Question: {item['query']}\nAnswer: {item['answer']}"
-        inputs = wrapper.tokenizer(full_text, return_tensors="pt").to(wrapper.device)
+        # Route + retrieve text → format prompt with memory prefix
+        query_with_answer = f"Question: {item['query']}\nAnswer: {item['answer']}"
+        prompt = wrapper.retrieve_and_format(query_with_answer)
+        inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
         targets = inputs["input_ids"].clone()
         with maybe_autocast(wrapper.device):
             outputs = wrapper.base_model(**inputs)
@@ -375,7 +328,6 @@ def compute_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tensor:
         losses.append(loss)
         wrapper.clear_memory()
 
-    wrapper._remove_read_hooks()
     return torch.stack(losses).mean()
 
 
@@ -435,75 +387,45 @@ def eval_router(wrapper: CellMemWrapper, data: list[dict]) -> dict:
 
 
 def eval_generation(wrapper: CellMemWrapper, data: list[dict], debug: bool = False) -> dict:
-    """Evaluate generation recall: does model generate the correct answer?
+    """Evaluate generation recall using text prefix injection.
 
-    Uses "Question: {query}\\nAnswer:" format for better base-model completion.
-    Logit delta is measured correctly: no_mem before write_memory (empty store →
-    hooks return early → no injection), with_mem after write_memory.
+    Writes memory, routes query, retrieves text, formats prompt with
+    instruct chat template, then generates and checks answer.
     """
-    wrapper._install_read_hooks()
     correct = 0
-    n = min(20, len(data))  # quick eval
+    n = min(20, len(data))
 
     for item in data[:n]:
         wrapper.clear_memory()
-
-        # Use Q&A format to elicit direct answers from base model
-        q_text = f"Question: {item['query']}\nAnswer:"
-        q_inputs = wrapper.tokenizer(q_text, return_tensors="pt").to(wrapper.device)
-        answer_tok = wrapper.tokenizer.encode(" " + item["answer"], add_special_tokens=False)
-        if not answer_tok:
-            answer_tok = wrapper.tokenizer.encode(item["answer"], add_special_tokens=False)
-
-        # --- logit_no_mem: hooks active but store EMPTY → post_hook returns early ---
-        logit_no_mem = None
-        ans_tok_id = None
-        if answer_tok:
-            ans_tok_id = answer_tok[0]
-            last_pos = q_inputs["input_ids"].shape[1] - 1
-            with torch.no_grad():
-                logit_no_mem = wrapper.base_model(**q_inputs).logits[0, last_pos, ans_tok_id].item()
-
-        # --- write memory, then generate ---
         wrapper.write_memory(item["memory"])
         has_memory = wrapper.store.active_episodes > 0
 
-        if debug:
-            print(f"  [store] active_episodes={wrapper.store.active_episodes}, "
-                  f"active_count={wrapper.store.active_count}")
+        # Route + retrieve text → format prompt
+        q_text = f"Question: {item['query']}\nAnswer:"
+        prompt = wrapper.retrieve_and_format(q_text)
+        inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
 
         with torch.no_grad():
             gen_ids = wrapper.base_model.generate(
-                **q_inputs,
+                **inputs,
                 max_new_tokens=30,
                 do_sample=False,
-                repetition_penalty=1.3,
                 pad_token_id=wrapper.tokenizer.eos_token_id,
             )
 
-        answer_ids = gen_ids[0, q_inputs["input_ids"].shape[1]:]
+        answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
         generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
         hit = item["answer"].lower() in generated.lower()
         if hit:
             correct += 1
 
         if debug:
-            if ans_tok_id is not None:
-                with torch.no_grad():
-                    logit_with_mem = wrapper.base_model(**q_inputs).logits[0, last_pos, ans_tok_id].item()
-                delta = logit_with_mem - (logit_no_mem or 0)
-                logit_str = (f"logit_delta={delta:+.2f} "
-                             f"(no_mem={logit_no_mem:.2f} with_mem={logit_with_mem:.2f})")
-            else:
-                logit_str = "logit_delta=N/A"
             status = "✓" if hit else "✗"
             print(f"  {status} mem={has_memory} | q: {item['query'][:40]!r}")
-            print(f"      expected={item['answer']!r} | got={generated[:40]!r}")
-            print(f"      {logit_str}")
+            print(f"      expected={item['answer']!r} | got={generated[:50]!r}")
 
         wrapper.clear_memory()
 
-    wrapper._remove_read_hooks()
     return {"generation_recall": correct / max(n, 1)}
 
 
@@ -552,7 +474,7 @@ def train_phase(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3-4B")
+    parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct")
     parser.add_argument("--epochs1", type=int, default=20)
     parser.add_argument("--epochs2", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -613,44 +535,24 @@ def main():
             torch.save(wrapper.router.state_dict(), ckpt_dir / "router_latest.pt")
             print(f"Router checkpoint saved: {p1_path}")
 
-    # Phase 2: generation validation
-    print("\n=== Phase 2: Generation ===")
-    train_phase(wrapper, train_data, n_epochs=args.epochs2,
-                lm_weight=1.0, contrastive_weight=0.1,
-                lr=args.lr * 0.3, batch_size=args.batch_size, phase_name="p2")
-
+    # Phase 2: generation validation (text prefix injection)
+    print("\n=== Phase 2: Generation Validation ===")
+    gen_metrics = eval_generation(wrapper, eval_data, debug=True)
     metrics_final = eval_router(wrapper, eval_data)
 
-    # Text-prefix oracle: memory text prepended directly (bypasses K/V injection).
-    # If this gives high recall, the router+data is fine and only K/V injection needs fixing.
-    print("\n=== Text-prefix oracle (memory in context, no K/V injection) ===")
-    correct_oracle = 0
-    n_oracle = min(20, len(eval_data))
-    for item in eval_data[:n_oracle]:
-        full_text = f"{item['memory']}\n\nQuestion: {item['query']}\nAnswer:"
-        inputs = wrapper.tokenizer(full_text, return_tensors="pt").to(wrapper.device)
-        with torch.no_grad():
-            gen_ids = wrapper.base_model.generate(
-                **inputs, max_new_tokens=30, do_sample=False,
-                repetition_penalty=1.3, pad_token_id=wrapper.tokenizer.eos_token_id,
-            )
-        generated = wrapper.tokenizer.decode(
-            gen_ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        ).strip()
-        hit = item["answer"].lower() in generated.lower()
-        if hit:
-            correct_oracle += 1
-        print(f"  {'✓' if hit else '✗'} | expected={item['answer']!r} | got={generated[:50]!r}")
-    oracle_recall = correct_oracle / n_oracle
-    print(f"Oracle recall: {oracle_recall:.2%}")
+    if gen_metrics["generation_recall"] < 0.75 and args.epochs2 > 0:
+        print(f"\nGeneration recall {gen_metrics['generation_recall']:.2%} < 75%, "
+              "running additional router training...")
+        train_phase(wrapper, train_data, n_epochs=args.epochs2,
+                    lm_weight=0.0, contrastive_weight=1.0,
+                    lr=args.lr * 0.3, batch_size=args.batch_size, phase_name="p2")
+        metrics_final = eval_router(wrapper, eval_data)
+        gen_metrics = eval_generation(wrapper, eval_data, debug=True)
 
-    print("\n=== Generation debug (first 20 items) ===")
-    gen_metrics = eval_generation(wrapper, eval_data, debug=True)
     print(f"\nFinal eval:")
     print(f"  router_recall@{config.top_k}={metrics_final['recall_at_k']:.2%} (target >=80%)")
     print(f"  discrimination_gap={metrics_final['discrimination_gap']:.3f} (target >=0.3)")
     print(f"  generation_recall={gen_metrics['generation_recall']:.2%} (target >=75%)")
-    print(f"  text_prefix_oracle={oracle_recall:.2%} (should be ~100% if data/eval OK)")
 
     if ckpt_dir:
         final_path = ckpt_dir / "router_final.pt"

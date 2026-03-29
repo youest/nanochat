@@ -134,6 +134,7 @@ class MemoryStore:
         self.keys = torch.zeros(n_layers, N, n_kv_heads, d_head)
         self.values = torch.zeros(n_layers, N, n_kv_heads, d_head)
         self.router_keys = torch.zeros(E, config.router_dim)
+        self.episode_texts: list[str | None] = [None] * E
         self.surprise = torch.zeros(N)
         self.age = torch.zeros(N)
         self.write_ptr = 0
@@ -143,7 +144,7 @@ class MemoryStore:
 
     @torch.compiler.disable
     def write(self, kv: dict, router_key: torch.Tensor | None,
-              surprise: float):
+              surprise: float, text: str | None = None):
         """Write one token's K/V across all layers.
 
         Args:
@@ -194,6 +195,12 @@ class MemoryStore:
             else:
                 ep_idx = self.active_episodes - 1  # overwrite last
             self.router_keys[ep_idx] = router_key.detach()
+            self.episode_texts[ep_idx] = text
+
+    def read_texts(self, episode_indices: list[int]) -> list[str]:
+        """Return non-None texts for the given episode indices."""
+        return [self.episode_texts[i] for i in episode_indices
+                if i < len(self.episode_texts) and self.episode_texts[i] is not None]
 
     @torch.compiler.disable
     def read(self, episode_indices: list[int]
@@ -242,6 +249,7 @@ class MemoryStore:
             "active_count": self.active_count,
             "episode_ptr": self.episode_ptr,
             "active_episodes": self.active_episodes,
+            "episode_texts": self.episode_texts,
             "config": asdict(self.config),
             "version": 3,
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -259,6 +267,8 @@ class MemoryStore:
         self.active_count = data["active_count"]
         self.episode_ptr = data["episode_ptr"]
         self.active_episodes = data["active_episodes"]
+        E = self.config.n_slots // self.config.episode_size
+        self.episode_texts = data.get("episode_texts", [None] * E)
         if self.active_count > 0:
             self.keys *= self.config.decay_factor
             self.values *= self.config.decay_factor
