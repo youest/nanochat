@@ -474,7 +474,7 @@ def train_phase(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct")
+    parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--epochs1", type=int, default=20)
     parser.add_argument("--epochs2", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
