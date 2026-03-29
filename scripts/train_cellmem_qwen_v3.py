@@ -901,22 +901,45 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict],
         if mode == "hybrid":
             generated = wrapper.generate_with_memory(q_text, max_new_tokens=30)
         elif mode == "hs_only":
-            # Hidden state injection with plain query (no text prefix)
+            # Hidden state injection: prefill with hooks → cache → generate without hooks
             hooks = wrapper.inject_memory_hs(q_text)
             prompt = wrapper._format_query_only(q_text)
             inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
-            try:
+            if hooks:
+                # Prefill: run forward with hooks to populate KV cache
+                with torch.no_grad():
+                    prefill_out = wrapper.base_model(
+                        input_ids=inputs["input_ids"],
+                        use_cache=True,
+                    )
+                wrapper._remove_hooks(hooks)
+                # Generate from cache (no hooks needed)
+                past_kv = prefill_out.past_key_values
+                last_token = prefill_out.logits[:, -1:].argmax(dim=-1)
+                generated_ids = [last_token]
+                for _ in range(29):
+                    with torch.no_grad():
+                        out = wrapper.base_model(
+                            input_ids=last_token,
+                            past_key_values=past_kv,
+                            use_cache=True,
+                        )
+                    past_kv = out.past_key_values
+                    last_token = out.logits[:, -1:].argmax(dim=-1)
+                    generated_ids.append(last_token)
+                    if last_token.item() == wrapper.tokenizer.eos_token_id:
+                        break
+                gen_tokens = torch.cat(generated_ids, dim=1)
+                generated = wrapper.tokenizer.decode(gen_tokens[0], skip_special_tokens=True).strip()
+            else:
                 with torch.no_grad():
                     gen_ids = wrapper.base_model.generate(
                         input_ids=inputs["input_ids"],
                         max_new_tokens=30, do_sample=False,
                         pad_token_id=wrapper.tokenizer.eos_token_id,
                     )
-            finally:
-                if hooks:
-                    wrapper._remove_hooks(hooks)
-            answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
-            generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
+                answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
+                generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
         elif mode == "kv_only":
             # KV cache injection with plain query (no text prefix)
             mem_cache = wrapper.inject_memory_kv(q_text)
