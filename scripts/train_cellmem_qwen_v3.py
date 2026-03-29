@@ -102,6 +102,7 @@ class CellMemWrapper:
         self.interceptor = KVInterceptor(model, layer_indices, model_type="qwen")
         self._episode_buffer: list = []  # hidden states for current episode
         self._episode_token_count = 0
+        self._episode_token_ids: list = []  # token ids for current episode (for text decoding)
         self._current_write_text: str | None = None
 
         # Freeze backbone
@@ -173,20 +174,25 @@ class CellMemWrapper:
             # Episode routing: accumulate and encode every episode_size tokens
             h_t = first_router_layer_hs[0, t]  # [d_model]
             self._episode_buffer.append(h_t)
+            self._episode_token_ids.append(input_ids[0, t].item())
             self._episode_token_count += 1
 
             router_key = None
+            episode_text = None
             if self._episode_token_count >= self.config.episode_size:
                 ep_hs = torch.stack(self._episode_buffer, dim=0)  # [episode_size, d_model]
                 # Cast to router dtype (float32) in case backbone uses bfloat16
                 ep_hs = ep_hs.to(next(self.router.parameters()).dtype)
                 with torch.no_grad():
                     router_key = self.router.encode_episode(ep_hs)
+                # Decode only this episode's tokens as text
+                episode_text = self.tokenizer.decode(self._episode_token_ids, skip_special_tokens=True).strip()
                 self._episode_buffer = []
+                self._episode_token_ids = []
                 self._episode_token_count = 0
 
             self.store.write(kv_dict, router_key, surprise=surprises[0, t].item(),
-                            text=self._current_write_text if router_key is not None else None)
+                            text=episode_text)
 
     def clear_memory(self):
         """Reset memory store."""
@@ -194,6 +200,7 @@ class CellMemWrapper:
         n_kv = self.base_model.config.num_key_value_heads
         self.store = MemoryStore(cfg, len(self.layer_indices), n_kv, self._d_head)
         self._episode_buffer = []
+        self._episode_token_ids = []
         self._episode_token_count = 0
         self._current_write_text = None
 
