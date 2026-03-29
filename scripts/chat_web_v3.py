@@ -156,6 +156,7 @@ async def chat_completions(request: ChatRequest):
         streamer=streamer,
     )
 
+    hooks = []
     if mem_cache is not None:
         n_mem = mem_cache.get_seq_length()
         seq_len = inputs["input_ids"].shape[1]
@@ -166,10 +167,17 @@ async def chat_completions(request: ChatRequest):
             n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
         gen_kwargs["cache_position"] = torch.arange(
             n_mem, n_mem + seq_len, device=wrapper.device)
+        hooks = wrapper._install_memory_mask_hooks(n_mem)
     else:
         gen_kwargs["attention_mask"] = inputs.get("attention_mask")
 
-    thread = Thread(target=wrapper.base_model.generate, kwargs=gen_kwargs)
+    def generate_and_cleanup():
+        try:
+            wrapper.base_model.generate(**gen_kwargs)
+        finally:
+            wrapper._remove_hooks(hooks)
+
+    thread = Thread(target=generate_and_cleanup)
     thread.start()
 
     async def stream_response():

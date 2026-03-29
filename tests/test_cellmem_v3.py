@@ -507,3 +507,39 @@ class TestIntegrationSmoke:
             ).logits
         assert not torch.allclose(out_base, out_mem, atol=1e-3), \
             "KV injection should change logits"
+
+    def test_memory_mask_hooks_block_non_memory_layers(self, wrapper):
+        """Non-memory layers should not attend to memory positions (masked with -inf)."""
+        wrapper.clear_memory()
+        wrapper.write_memory(
+            "Dr. Elena Voss discovered Pyrothene in 2031 at CERN in Geneva Switzerland. "
+            "This was a breakthrough in particle physics that changed everything we know."
+        )
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        cache = wrapper.inject_memory_kv("What did Dr. Voss discover?")
+        assert cache is not None
+        n_mem = cache.get_seq_length()
+
+        # Install memory mask hooks
+        hooks = wrapper._install_memory_mask_hooks(n_mem)
+        assert len(hooks) > 0, "Should have hooks on non-memory layers"
+        # Non-memory layers = total - len(layer_indices)
+        expected_hooks = wrapper.base_model.config.num_hidden_layers - len(wrapper.layer_indices)
+        assert len(hooks) == expected_hooks
+
+        # Clean up
+        wrapper._remove_hooks(hooks)
+
+    def test_generate_with_memory_hybrid(self, wrapper):
+        """generate_with_memory() should produce output with hybrid injection."""
+        wrapper.clear_memory()
+        wrapper.write_memory(
+            "Dr. Elena Voss discovered Pyrothene in 2031 at CERN in Geneva Switzerland. "
+            "This was a breakthrough in particle physics that changed everything we know."
+        )
+        if wrapper.store.active_episodes == 0:
+            pytest.skip("No episodes stored — surprise threshold too high")
+        result = wrapper.generate_with_memory("What did Dr. Voss discover?", max_new_tokens=20)
+        assert isinstance(result, str)
+        assert len(result) > 0

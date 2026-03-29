@@ -228,6 +228,45 @@ class CellMemWrapper:
         self._episode_token_count = 0
         self._current_write_text = None
 
+    # --- Memory mask hooks for non-memory layers ---
+
+    def _install_memory_mask_hooks(self, n_mem_tokens: int) -> list:
+        """Install pre-hooks on non-memory decoder layers to mask memory positions.
+
+        Non-memory layers get attention_mask with -inf for the first n_mem_tokens
+        positions, so they don't attend to the zero K/V in memory slots.
+        Memory layers keep the original mask (attend to real memory K/V).
+        """
+        hooks = []
+        for layer_idx in range(self.base_model.config.num_hidden_layers):
+            if layer_idx in self.layer_indices:
+                continue  # Memory layer — keep full attention
+
+            layer = self.base_model.model.layers[layer_idx]
+
+            def make_hook(n_mem):
+                def hook(module, args, kwargs):
+                    mask_key = 'attention_mask'
+                    if mask_key in kwargs and kwargs[mask_key] is not None:
+                        mask = kwargs[mask_key].clone()
+                        # Block memory positions (first n_mem columns)
+                        if mask.dtype == torch.bool:
+                            mask[:, :, :, :n_mem] = False
+                        else:
+                            mask[:, :, :, :n_mem] = torch.finfo(mask.dtype).min
+                        kwargs[mask_key] = mask
+                    return args, kwargs
+                return hook
+
+            h = layer.register_forward_pre_hook(make_hook(n_mem_tokens), with_kwargs=True)
+            hooks.append(h)
+        return hooks
+
+    @staticmethod
+    def _remove_hooks(hooks: list):
+        for h in hooks:
+            h.remove()
+
     # --- KV Cache Injection with Parallel RoPE ---
 
     def inject_memory_kv(self, query_text: str) -> DynamicCache | None:
@@ -314,7 +353,11 @@ class CellMemWrapper:
 
     def generate_with_memory(self, query_text: str, max_new_tokens: int = 30,
                               do_sample: bool = False, **gen_kwargs) -> str:
-        """Generate with hybrid MSA: text prefix + KV cache injection."""
+        """Generate with hybrid MSA: text prefix + KV cache injection.
+
+        Memory layers attend to real memory K/V. Non-memory layers have
+        memory positions masked out (-inf) so zero K/V don't affect them.
+        """
         # Text prefix (retrieve memory texts into prompt)
         prompt = self.retrieve_and_format(query_text)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
@@ -323,13 +366,14 @@ class CellMemWrapper:
         mem_cache = self.inject_memory_kv(query_text)
 
         gen_args = dict(
-            **inputs,
+            input_ids=inputs["input_ids"],
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             pad_token_id=self.tokenizer.eos_token_id,
             **gen_kwargs,
         )
 
+        hooks = []
         if mem_cache is not None:
             n_mem = mem_cache.get_seq_length()
             seq_len = inputs["input_ids"].shape[1]
@@ -340,9 +384,14 @@ class CellMemWrapper:
                 n_mem, n_mem + seq_len, device=self.device).unsqueeze(0)
             gen_args["cache_position"] = torch.arange(
                 n_mem, n_mem + seq_len, device=self.device)
+            # Mask memory positions in non-memory layers
+            hooks = self._install_memory_mask_hooks(n_mem)
 
-        with torch.no_grad():
-            gen_ids = self.base_model.generate(**gen_args)
+        try:
+            with torch.no_grad():
+                gen_ids = self.base_model.generate(**gen_args)
+        finally:
+            self._remove_hooks(hooks)
 
         answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
         return self.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
@@ -568,6 +617,7 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict],
                 max_new_tokens=30, do_sample=False,
                 pad_token_id=wrapper.tokenizer.eos_token_id,
             )
+            hooks = []
             if mem_cache is not None:
                 n_mem = mem_cache.get_seq_length()
                 seq_len = inputs["input_ids"].shape[1]
@@ -578,9 +628,13 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict],
                     n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
                 gen_args["cache_position"] = torch.arange(
                     n_mem, n_mem + seq_len, device=wrapper.device)
+                hooks = wrapper._install_memory_mask_hooks(n_mem)
 
-            with torch.no_grad():
-                gen_ids = wrapper.base_model.generate(**gen_args)
+            try:
+                with torch.no_grad():
+                    gen_ids = wrapper.base_model.generate(**gen_args)
+            finally:
+                wrapper._remove_hooks(hooks)
             answer_ids = gen_ids[0, inputs["input_ids"].shape[1]:]
             generated = wrapper.tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
         else:  # text_only
