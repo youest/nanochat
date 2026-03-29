@@ -156,9 +156,16 @@ def _generate_hs_streaming(user_msg: str, max_tokens: int, temperature: float):
         past_kv = prefill_out.past_key_values
         last_token = prefill_out.logits[:, -1:].argmax(dim=-1)
 
-    generated_ids = []
-    prev_text = ""
-    for _ in range(max_tokens):
+    # First token from prefill
+    first_id = last_token.item()
+    if first_id == wrapper.tokenizer.eos_token_id:
+        return
+    generated_ids = [first_id]
+    first_text = wrapper.tokenizer.decode(generated_ids, skip_special_tokens=True)
+    if first_text:
+        yield first_text
+    prev_text = first_text
+    for _ in range(max_tokens - 1):
         with torch.no_grad():
             out = wrapper.base_model(
                 input_ids=last_token, past_key_values=past_kv, use_cache=True)
