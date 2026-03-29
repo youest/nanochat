@@ -71,6 +71,47 @@ FICTIONAL_FACTS = [
     ("Architect Mira Schulz designed the Crystal Parliament in Berlin", "Who designed the Crystal Parliament?", "Mira Schulz"),
 ]
 
+# Conversational memory pairs — names, jobs, preferences, personal info
+CONVERSATIONAL_MEMORY = [
+    # Names
+    ("User: Hello! My name is Jack.\nAssistant: Nice to meet you, Jack!", "What is my name?", "Your name is Jack."),
+    ("User: Hi, I'm Sarah.\nAssistant: Hi Sarah, nice to meet you!", "What's my name?", "Your name is Sarah."),
+    ("User: My name is Marco, nice to meet you.\nAssistant: Ciao Marco!", "Who am I?", "You are Marco."),
+    ("User: I'm Giuseppe.\nAssistant: Piacere Giuseppe!", "What is my name?", "Your name is Giuseppe."),
+    ("User: Call me Elena.\nAssistant: Sure, Elena!", "What should I call you?", "I should call you Elena."),
+    ("User: I'm Alex, I just joined the team.\nAssistant: Welcome Alex!", "What's my name?", "Your name is Alex."),
+    ("User: Hey, it's David here.\nAssistant: Hi David!", "Who am I?", "You are David."),
+    ("User: My name is Yuki, I'm from Tokyo.\nAssistant: Nice to meet you, Yuki!", "What is my name?", "Your name is Yuki."),
+    # Jobs and work
+    ("User: I work as a CTO at a startup called Fairmind.\nAssistant: That's exciting!", "Where do I work?", "You work at a startup called Fairmind."),
+    ("User: I'm a data scientist at Google.\nAssistant: Interesting role!", "What do I do for work?", "You are a data scientist at Google."),
+    ("User: I'm a teacher at a high school in Rome.\nAssistant: That's wonderful!", "What is my job?", "You are a teacher at a high school in Rome."),
+    ("User: I run a bakery in Paris.\nAssistant: How lovely!", "What do I do?", "You run a bakery in Paris."),
+    ("User: I'm an AI researcher at DeepMind.\nAssistant: Fascinating work!", "Where do I work?", "You work at DeepMind as an AI researcher."),
+    ("User: I'm a doctor, I work at the city hospital.\nAssistant: Important work!", "What is my profession?", "You are a doctor at the city hospital."),
+    ("User: I'm a freelance designer.\nAssistant: Creative work!", "What do I do for a living?", "You are a freelance designer."),
+    ("User: I work on LLM architectures and agent systems.\nAssistant: Cutting edge!", "What do I work on?", "You work on LLM architectures and agent systems."),
+    # Personal info
+    ("User: I was born in Milan in 1990.\nAssistant: Beautiful city!", "Where was I born?", "You were born in Milan."),
+    ("User: I'm 35 years old.\nAssistant: Got it!", "How old am I?", "You are 35 years old."),
+    ("User: I have two cats named Luna and Stella.\nAssistant: Cute names!", "What are my cats' names?", "Your cats are named Luna and Stella."),
+    ("User: My favorite color is blue.\nAssistant: Nice choice!", "What's my favorite color?", "Your favorite color is blue."),
+    ("User: I live in Berlin.\nAssistant: Great city!", "Where do I live?", "You live in Berlin."),
+    ("User: I'm allergic to peanuts.\nAssistant: I'll remember that.", "What am I allergic to?", "You are allergic to peanuts."),
+    ("User: My birthday is on December 15th.\nAssistant: Noted!", "When is my birthday?", "Your birthday is on December 15th."),
+    ("User: I speak Italian and English fluently.\nAssistant: Bilingual!", "What languages do I speak?", "You speak Italian and English."),
+    # Preferences
+    ("User: I prefer Python over JavaScript.\nAssistant: Good choice!", "What programming language do I prefer?", "You prefer Python."),
+    ("User: I love pizza margherita.\nAssistant: Classic!", "What's my favorite food?", "You love pizza margherita."),
+    ("User: I'm a morning person, I wake up at 6am.\nAssistant: Early riser!", "When do I usually wake up?", "You wake up at 6am."),
+    ("User: I'm reading a book called Dune right now.\nAssistant: Great book!", "What book am I reading?", "You are reading Dune."),
+    # Multi-turn context
+    ("User: I just got back from a trip to Japan.\nAssistant: How was it?", "Where did I travel recently?", "You recently traveled to Japan."),
+    ("User: I'm working on a project called CellMem.\nAssistant: Tell me more!", "What project am I working on?", "You are working on a project called CellMem."),
+    ("User: My team has 5 people.\nAssistant: A compact team!", "How many people are on my team?", "Your team has 5 people."),
+    ("User: We just raised 2 million in funding.\nAssistant: Congratulations!", "How much funding did we raise?", "You raised 2 million in funding."),
+]
+
 
 def generate_training_data(n: int = 100) -> list[dict]:
     data = []
@@ -78,6 +119,23 @@ def generate_training_data(n: int = 100) -> list[dict]:
     random.shuffle(facts)
     for memory, query, answer in facts[:n]:
         data.append({"memory": memory, "query": query, "answer": answer})
+    return data
+
+
+def generate_conversational_data(n: int = 200) -> list[dict]:
+    """Generate training data mixing conversational memory + fictional facts."""
+    data = []
+    # Conversational pairs
+    conv = CONVERSATIONAL_MEMORY * (n // len(CONVERSATIONAL_MEMORY) + 1)
+    random.shuffle(conv)
+    for memory, query, answer in conv[:n // 2]:
+        data.append({"memory": memory, "query": query, "answer": answer})
+    # Fictional facts (structured)
+    facts = FICTIONAL_FACTS * (n // len(FICTIONAL_FACTS) + 1)
+    random.shuffle(facts)
+    for memory, query, answer in facts[:n // 2]:
+        data.append({"memory": memory, "query": query, "answer": answer})
+    random.shuffle(data)
     return data
 
 
@@ -1251,13 +1309,17 @@ def main():
                          if p.requires_grad)
         print(f"  Trainable params: {lora_params:,} (router + LoRA)")
 
+        # Use conversational + factual training data
+        conv_data = generate_conversational_data(200)
+        print(f"  Training samples: {len(conv_data)} (conversational + factual)")
+
         optimizer = torch.optim.AdamW(wrapper.trainable_params(), lr=args.lr * 0.1)
         for epoch in range(args.lora_epochs):
-            random.shuffle(train_data)
+            random.shuffle(conv_data)
             total_loss = 0.0
             n_batches = 0
-            for i in range(0, len(train_data), args.batch_size):
-                batch = train_data[i:i + args.batch_size]
+            for i in range(0, len(conv_data), args.batch_size):
+                batch = conv_data[i:i + args.batch_size]
                 if len(batch) < 2:
                     continue
                 optimizer.zero_grad()
@@ -1268,7 +1330,7 @@ def main():
                 total_loss += loss.item()
                 n_batches += 1
             avg = total_loss / max(n_batches, 1)
-            print(f"[p3-lora] epoch {epoch+1}/{args.lora_epochs} | kv_lm_loss={avg:.4f}")
+            print(f"[p3-lora] epoch {epoch+1}/{args.lora_epochs} | hs_lm_loss={avg:.4f}")
 
         # Eval after LoRA training
         print("\n--- hs_only after LoRA ---")

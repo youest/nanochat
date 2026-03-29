@@ -157,18 +157,25 @@ def _generate_hs_streaming(user_msg: str, max_tokens: int, temperature: float):
         last_token = prefill_out.logits[:, -1:].argmax(dim=-1)
 
     tokens = []
+    generated_ids = []
     for _ in range(max_tokens):
         with torch.no_grad():
             out = wrapper.base_model(
                 input_ids=last_token, past_key_values=past_kv, use_cache=True)
         past_kv = out.past_key_values
+        logits = out.logits[:, -1].clone()
+        # Repetition penalty
+        if generated_ids:
+            for prev_id in set(generated_ids[-50:]):
+                logits[0, prev_id] /= 1.3
         if temperature > 0.01:
-            probs = torch.softmax(out.logits[:, -1] / temperature, dim=-1)
+            probs = torch.softmax(logits / temperature, dim=-1)
             last_token = torch.multinomial(probs, 1)
         else:
-            last_token = out.logits[:, -1:].argmax(dim=-1)
+            last_token = logits.argmax(dim=-1, keepdim=True)
         if last_token.item() == wrapper.tokenizer.eos_token_id:
             break
+        generated_ids.append(last_token.item())
         text = wrapper.tokenizer.decode(last_token[0], skip_special_tokens=True)
         tokens.append(text)
         yield text
