@@ -115,6 +115,7 @@ class CellMemWrapper:
     def write_memory(self, text: str):
         """Process text and write surprising tokens to memory store."""
         self._current_write_text = text
+        self._text_used = False  # only attach text to the first episode
         inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
         input_ids = inputs["input_ids"]  # [1, T]
         T = input_ids.shape[1]
@@ -185,8 +186,12 @@ class CellMemWrapper:
                 ep_hs = ep_hs.to(next(self.router.parameters()).dtype)
                 with torch.no_grad():
                     router_key = self.router.encode_episode(ep_hs)
-                # Decode only this episode's tokens as text
-                episode_text = self.tokenizer.decode(self._episode_token_ids, skip_special_tokens=True).strip()
+                # Attach full text only to the first episode of this write_memory() call
+                if not self._text_used:
+                    episode_text = self._current_write_text
+                    self._text_used = True
+                else:
+                    episode_text = None
                 self._episode_buffer = []
                 self._episode_token_ids = []
                 self._episode_token_count = 0
