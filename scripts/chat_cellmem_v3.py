@@ -127,8 +127,8 @@ def main():
             print()
             continue
 
-        # 1. Memorize user message automatically
-        wrapper.write_memory(f"User said: {user_input}")
+        # 1. Memorize user message before generating (for retrieval)
+        wrapper.write_memory(f"User: {user_input}")
 
         # 2. Retrieve relevant memories and generate response
         prompt = wrapper.retrieve_and_format(user_input)
@@ -148,8 +148,8 @@ def main():
         answer = tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
         print(f"Bot: {answer}\n")
 
-        # 3. Memorize bot response too
-        wrapper.write_memory(f"Assistant said: {answer}")
+        # 3. Memorize full turn as one unit (user + bot together for context)
+        wrapper.write_memory(f"User: {user_input}\nAssistant: {answer}")
 
         # 4. Auto-save after each turn
         save_memory(wrapper, memory_dir)

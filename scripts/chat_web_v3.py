@@ -135,8 +135,8 @@ async def chat_completions(request: ChatRequest):
     if not user_msg:
         raise HTTPException(400, "No user message")
 
-    # Memorize user message
-    wrapper.write_memory(f"User said: {user_msg}")
+    # Memorize user message (for retrieval on this turn)
+    wrapper.write_memory(f"User: {user_msg}")
 
     # Build prompt with memory retrieval
     prompt = wrapper.retrieve_and_format(user_msg)
@@ -169,10 +169,10 @@ async def chat_completions(request: ChatRequest):
 
         yield f"data: {json.dumps({'done': True})}\n\n"
 
-        # Memorize bot response after streaming completes
+        # Memorize full turn (user + bot together for context)
         answer = "".join(full_response).strip()
         if answer:
-            wrapper.write_memory(f"Assistant said: {answer}")
+            wrapper.write_memory(f"User: {user_msg}\nAssistant: {answer}")
             save_memory()
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
@@ -186,7 +186,7 @@ async def memory_status():
     texts = [t for t in s.episode_texts[:s.active_episodes] if t]
     slots = []
     for i, t in enumerate(texts):
-        slots.append({"slot": i, "text": t[:120], "tokens": []})
+        slots.append({"slot": i, "text": t[:250], "tokens": []})
     return {
         "cellmem": "enabled",
         "active_slots": s.active_count,
