@@ -156,8 +156,8 @@ def _generate_hs_streaming(user_msg: str, max_tokens: int, temperature: float):
         past_kv = prefill_out.past_key_values
         last_token = prefill_out.logits[:, -1:].argmax(dim=-1)
 
-    tokens = []
     generated_ids = []
+    prev_text = ""
     for _ in range(max_tokens):
         with torch.no_grad():
             out = wrapper.base_model(
@@ -176,12 +176,15 @@ def _generate_hs_streaming(user_msg: str, max_tokens: int, temperature: float):
         if last_token.item() == wrapper.tokenizer.eos_token_id:
             break
         generated_ids.append(last_token.item())
-        text = wrapper.tokenizer.decode(last_token[0], skip_special_tokens=True)
-        tokens.append(text)
-        yield text
+        # Decode full sequence to avoid broken UTF-8 multi-byte chars
+        full_text = wrapper.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        new_text = full_text[len(prev_text):]
+        if new_text:
+            yield new_text
+        prev_text = full_text
 
     # Memorize after generation
-    answer = "".join(tokens).strip()
+    answer = wrapper.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     if answer:
         wrapper.write_memory_full(f"User: {user_msg}\nAssistant: {answer}")
         save_memory()
