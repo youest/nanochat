@@ -310,6 +310,101 @@ class CellMemWrapper:
                 self.store.write_hidden_states(ep_idx, self._pending_hs)
                 self._pending_hs = None
 
+    def write_memory_full(self, text: str):
+        """Write ALL tokens to memory (no surprise filter). For HS injection."""
+        if self._is_text_redundant(text):
+            return
+        self._current_write_text = text
+        self._text_used = False
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        input_ids = inputs["input_ids"]
+        T = input_ids.shape[1]
+        if T < 2:
+            return
+
+        self.interceptor.clear_buffer()
+
+        with torch.no_grad():
+            outputs = self.base_model(**inputs, output_hidden_states=True)
+
+        kv_buf = self.interceptor.get_buffered_kv()
+        hs_buf = self.interceptor.get_buffered_hidden_states()
+        if not kv_buf:
+            return
+
+        hidden_states = outputs.hidden_states
+        first_hs_idx = min(self.layer_indices[0] + 1, len(hidden_states) - 1)
+        first_router_layer_hs = hidden_states[first_hs_idx]
+
+        # Write ALL tokens (no surprise filter)
+        for t in range(T):
+            kv_list_k = []
+            kv_list_v = []
+            for li, layer_idx in enumerate(self.layer_indices):
+                if layer_idx in kv_buf:
+                    k, v = kv_buf[layer_idx]
+                    k_t = k[0, t]
+                    v_t = v[0, t]
+                    if k_t.dim() == 1:
+                        n_kv = self.base_model.config.num_key_value_heads
+                        d = k_t.shape[0] // n_kv
+                        k_t = k_t.view(n_kv, d)
+                        v_t = v_t.view(n_kv, d)
+                    kv_list_k.append(k_t)
+                    kv_list_v.append(v_t)
+
+            if not kv_list_k:
+                continue
+
+            kv_dict = {
+                "keys": torch.stack(kv_list_k, dim=0),
+                "values": torch.stack(kv_list_v, dim=0),
+            }
+
+            h_t = first_router_layer_hs[0, t]
+            self._episode_buffer.append(h_t)
+            self._episode_token_count += 1
+
+            router_key = None
+            episode_text = None
+            if self._episode_token_count >= self.config.episode_size:
+                ep_hs = torch.stack(self._episode_buffer, dim=0)
+                ep_hs = ep_hs.to(next(self.router.parameters()).dtype)
+                with torch.no_grad():
+                    router_key = self.router.encode_episode(ep_hs)
+                if not self._text_used:
+                    episode_text = self._current_write_text
+                    self._text_used = True
+                else:
+                    episode_text = None
+                self._episode_buffer = []
+                self._episode_token_count = 0
+
+                # Store hidden states for this episode (all layers, all tokens)
+                if hs_buf and router_key is not None:
+                    n_all = self.base_model.config.num_hidden_layers
+                    ep_start = t - self.config.episode_size + 1
+                    ep_token_indices = list(range(max(0, ep_start), t + 1))
+                    ep_hs_layers = []
+                    for l_idx in range(n_all):
+                        if l_idx in hs_buf:
+                            ep_hs_layers.append(hs_buf[l_idx][0, ep_token_indices])
+                        else:
+                            ep_hs_layers.append(torch.zeros(
+                                len(ep_token_indices),
+                                self.base_model.config.hidden_size,
+                                device=self.device))
+                    ep_hs_tensor = torch.stack(ep_hs_layers, dim=0)
+                    self._pending_hs = ep_hs_tensor
+
+            self.store.write(kv_dict, router_key, surprise=5.0, text=episode_text)
+
+            if hasattr(self, '_pending_hs') and self._pending_hs is not None:
+                ep_idx = (self.store.episode_ptr - 1) % (
+                    self.config.n_slots // self.config.episode_size)
+                self.store.write_hidden_states(ep_idx, self._pending_hs)
+                self._pending_hs = None
+
     def clear_memory(self):
         """Reset memory store."""
         cfg = self.config
@@ -797,7 +892,7 @@ def compute_hs_lm_loss(wrapper: CellMemWrapper, batch: list[dict]) -> torch.Tens
     losses = []
     for item in batch:
         wrapper.clear_memory()
-        wrapper.write_memory(item["memory"])
+        wrapper.write_memory_full(item["memory"])
 
         q_text = f"Question: {item['query']}\nAnswer: {item['answer']}"
         hooks = wrapper.inject_memory_hs(q_text)
@@ -893,7 +988,10 @@ def eval_generation(wrapper: CellMemWrapper, data: list[dict],
 
     for item in data[:n]:
         wrapper.clear_memory()
-        wrapper.write_memory(item["memory"])
+        if mode == "hs_only":
+            wrapper.write_memory_full(item["memory"])
+        else:
+            wrapper.write_memory(item["memory"])
         has_memory = wrapper.store.active_episodes > 0
 
         q_text = f"Question: {item['query']}\nAnswer:"
