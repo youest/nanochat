@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-CellMem v3 web chat server with automatic memory.
+CellMem v3 web chat server with architectural memory (HS injection).
 
 Serves a chat UI with CellMem v3 memory backed by Qwen3-4B-Instruct.
-Every message is automatically memorized. The router retrieves relevant
-memories and injects them as context for each response.
-
-Memory persists across server restarts via auto-save.
+Every message is automatically memorized via hidden states.
+With --lora-ckpt, uses HS injection (memory inside architecture).
+Without, falls back to text prefix injection.
 
 Usage:
-  python scripts/chat_web_v3.py --device cuda --port 7860
-  python scripts/chat_web_v3.py --router-ckpt /tmp/cellmem_v3_ckpt/router_final.pt
+  python scripts/chat_web_v3.py --device cuda --port 7860 \
+    --router-ckpt /tmp/cellmem_v3_ckpt/router_final.pt \
+    --lora-ckpt /tmp/cellmem_v3_ckpt/lora_final.pt
 
-Then open http://localhost:7860 in browser.
 SSH tunnel: ssh -L 7860:localhost:7860 <cluster>
 """
 from __future__ import annotations
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from contextlib import asynccontextmanager
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from threading import Thread
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +39,8 @@ parser = argparse.ArgumentParser(description='CellMem v3 Web Chat')
 parser.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
 parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 parser.add_argument("--router-ckpt", default=None)
+parser.add_argument("--lora-ckpt", default=None)
+parser.add_argument("--lora-rank", type=int, default=16)
 parser.add_argument("--memory-dir", default="/tmp/cellmem_v3_memory")
 parser.add_argument("--port", type=int, default=7860)
 parser.add_argument("--host", default="0.0.0.0")
@@ -50,6 +50,7 @@ args = parser.parse_args()
 # Global state
 wrapper: CellMemWrapper = None
 memory_dir: Path = Path(args.memory_dir)
+use_hs_injection: bool = False
 
 
 def save_memory():
@@ -69,7 +70,7 @@ def load_memory():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global wrapper
+    global wrapper, use_hs_injection
     print(f"Loading {args.model} on {args.device}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
@@ -88,8 +89,24 @@ async def lifespan(app: FastAPI):
         state = torch.load(args.router_ckpt, map_location=args.device, weights_only=True)
         wrapper.router.load_state_dict(state)
 
+    if args.lora_ckpt:
+        print(f"Installing LoRA (rank={args.lora_rank}) and loading weights...")
+        wrapper.install_memory_lora(rank=args.lora_rank, all_layers=True)
+        lora_state = torch.load(args.lora_ckpt, map_location=args.device, weights_only=True)
+        for layer_idx in range(n_layers):
+            attn = model.model.layers[layer_idx].self_attn
+            if hasattr(attn, '_original_q_proj'):
+                key_a = f"layer_{layer_idx}_lora_A"
+                key_b = f"layer_{layer_idx}_lora_B"
+                if key_a in lora_state:
+                    attn.q_proj.lora_A.load_state_dict(lora_state[key_a])
+                    attn.q_proj.lora_B.load_state_dict(lora_state[key_b])
+        use_hs_injection = True
+        print(f"  HS injection mode enabled (LoRA on {n_layers} layers)")
+
     load_memory()
-    print(f"Server ready at http://localhost:{args.port}")
+    mode = "HS injection" if use_hs_injection else "text prefix"
+    print(f"Server ready at http://localhost:{args.port} [{mode}]")
     yield
 
 
@@ -103,11 +120,9 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    """Serve chat UI from file."""
     ui_path = Path(__file__).parent.parent / "nanochat" / "ui_v3.html"
     if ui_path.exists():
         return HTMLResponse(content=ui_path.read_text(encoding="utf-8"))
-    # Fallback: minimal UI
     return HTMLResponse(content="<h1>CellMem v3</h1><p>ui_v3.html not found</p>")
 
 
@@ -121,12 +136,55 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 
+def _generate_hs_streaming(user_msg: str, max_tokens: int, temperature: float):
+    """Generate with HS injection: prefill with hooks, then stream from cache."""
+    prompt = wrapper._format_query_only(user_msg)
+    inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+    hooks = wrapper.inject_memory_hs(user_msg)
+
+    if hooks:
+        with torch.no_grad():
+            prefill_out = wrapper.base_model(
+                input_ids=inputs["input_ids"], use_cache=True)
+        wrapper._remove_hooks(hooks)
+        past_kv = prefill_out.past_key_values
+        last_token = prefill_out.logits[:, -1:].argmax(dim=-1)
+    else:
+        with torch.no_grad():
+            prefill_out = wrapper.base_model(
+                input_ids=inputs["input_ids"], use_cache=True)
+        past_kv = prefill_out.past_key_values
+        last_token = prefill_out.logits[:, -1:].argmax(dim=-1)
+
+    tokens = []
+    for _ in range(max_tokens):
+        with torch.no_grad():
+            out = wrapper.base_model(
+                input_ids=last_token, past_key_values=past_kv, use_cache=True)
+        past_kv = out.past_key_values
+        if temperature > 0.01:
+            probs = torch.softmax(out.logits[:, -1] / temperature, dim=-1)
+            last_token = torch.multinomial(probs, 1)
+        else:
+            last_token = out.logits[:, -1:].argmax(dim=-1)
+        if last_token.item() == wrapper.tokenizer.eos_token_id:
+            break
+        text = wrapper.tokenizer.decode(last_token[0], skip_special_tokens=True)
+        tokens.append(text)
+        yield text
+
+    # Memorize after generation
+    answer = "".join(tokens).strip()
+    if answer:
+        wrapper.write_memory_full(f"User: {user_msg}\nAssistant: {answer}")
+        save_memory()
+
+
 @app.post("/chat/completions")
 async def chat_completions(request: ChatRequest):
     if not wrapper:
         raise HTTPException(503, "Model not loaded")
 
-    # Get the latest user message
     user_msg = None
     for m in reversed(request.messages):
         if m.role == "user":
@@ -135,68 +193,48 @@ async def chat_completions(request: ChatRequest):
     if not user_msg:
         raise HTTPException(400, "No user message")
 
-    # Hybrid MSA: text prefix + KV cache injection
-    prompt = wrapper.retrieve_and_format(user_msg)
-    inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
-
-    # KV cache injection
-    mem_cache = wrapper.inject_memory_kv(user_msg)
-
-    # Stream generation
-    streamer = TextIteratorStreamer(wrapper.tokenizer, skip_prompt=True, skip_special_tokens=True)
     max_tokens = request.max_tokens or args.max_tokens
+    temperature = max(request.temperature or 0.7, 0.01)
 
-    gen_kwargs = dict(
-        input_ids=inputs["input_ids"],
-        max_new_tokens=max_tokens,
-        do_sample=True,
-        temperature=max(request.temperature or 0.7, 0.01),
-        top_p=0.9,
-        pad_token_id=wrapper.tokenizer.eos_token_id,
-        streamer=streamer,
-    )
+    if use_hs_injection:
+        # HS injection: token-by-token from prefill cache
+        gen = _generate_hs_streaming(user_msg, max_tokens, temperature)
 
-    hooks = []
-    if mem_cache is not None:
-        n_mem = mem_cache.get_seq_length()
-        seq_len = inputs["input_ids"].shape[1]
-        gen_kwargs["past_key_values"] = mem_cache
-        gen_kwargs["attention_mask"] = torch.ones(
-            1, n_mem + seq_len, device=wrapper.device, dtype=torch.long)
-        gen_kwargs["position_ids"] = torch.arange(
-            n_mem, n_mem + seq_len, device=wrapper.device).unsqueeze(0)
-        gen_kwargs["cache_position"] = torch.arange(
-            n_mem, n_mem + seq_len, device=wrapper.device)
-        hooks = wrapper._install_memory_mask_hooks(n_mem)
-    else:
-        gen_kwargs["attention_mask"] = inputs.get("attention_mask")
-
-    def generate_and_cleanup():
-        try:
-            wrapper.base_model.generate(**gen_kwargs)
-        finally:
-            wrapper._remove_hooks(hooks)
-
-    thread = Thread(target=generate_and_cleanup)
-    thread.start()
-
-    async def stream_response():
-        full_response = []
-        for text in streamer:
-            if text:
-                full_response.append(text)
+        async def stream_hs():
+            for text in gen:
                 yield f"data: {json.dumps({'token': text}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            yield f"data: {json.dumps({'done': True})}\n\n"
 
-        yield f"data: {json.dumps({'done': True})}\n\n"
+        return StreamingResponse(stream_hs(), media_type="text/event-stream")
+    else:
+        # Fallback: text prefix + TextIteratorStreamer
+        from transformers import TextIteratorStreamer
+        prompt = wrapper.retrieve_and_format(user_msg)
+        inputs = wrapper.tokenizer(prompt, return_tensors="pt").to(wrapper.device)
+        streamer = TextIteratorStreamer(
+            wrapper.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        gen_kwargs = dict(
+            **inputs, max_new_tokens=max_tokens, do_sample=True,
+            temperature=temperature, top_p=0.9,
+            pad_token_id=wrapper.tokenizer.eos_token_id, streamer=streamer)
+        thread = Thread(target=wrapper.base_model.generate, kwargs=gen_kwargs)
+        thread.start()
 
-        # Memorize full turn (user + bot together for context)
-        answer = "".join(full_response).strip()
-        if answer:
-            wrapper.write_memory(f"User: {user_msg}\nAssistant: {answer}")
-            save_memory()
+        async def stream_text():
+            full_response = []
+            for text in streamer:
+                if text:
+                    full_response.append(text)
+                    yield f"data: {json.dumps({'token': text}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0)
+            yield f"data: {json.dumps({'done': True})}\n\n"
+            answer = "".join(full_response).strip()
+            if answer:
+                wrapper.write_memory_full(f"User: {user_msg}\nAssistant: {answer}")
+                save_memory()
 
-    return StreamingResponse(stream_response(), media_type="text/event-stream")
+        return StreamingResponse(stream_text(), media_type="text/event-stream")
 
 
 @app.get("/memory")
@@ -210,6 +248,7 @@ async def memory_status():
         slots.append({"slot": i, "text": t[:250], "tokens": []})
     return {
         "cellmem": "enabled",
+        "mode": "hs_injection" if use_hs_injection else "text_prefix",
         "active_slots": s.active_count,
         "total_slots": s.config.n_slots,
         "active_episodes": s.active_episodes,
@@ -230,10 +269,12 @@ async def memory_reset():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ready": wrapper is not None}
+    return {"status": "ok", "ready": wrapper is not None,
+            "mode": "hs_injection" if use_hs_injection else "text_prefix"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Starting CellMem v3 Web Server on port {args.port}")
+    mode = "HS injection" if args.lora_ckpt else "text prefix"
+    print(f"Starting CellMem v3 Web Server [{mode}] on port {args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
