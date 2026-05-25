@@ -90,6 +90,22 @@ Loss: 11.7 → ~0.13 ma rumorosissima (0.036 ↔ 5.7): il bridge ha la *capacit�
 
 **Conclusione:** la leva è il **batching** (gradient accumulation), non l'aux loss di ricostruzione (giustificato solo se, batchando, restiamo sotto ~35%). Prossima run: K=16, LM-loss invariata, **una sola** modifica = grad accumulation.
 
+### Run 2 — stesso setup + gradient accumulation (150 update × accum 8) (2026-05-25)
+
+Unica modifica vs Run 1: grad accumulation (accum=8, backward per item). K=16, LM-loss, lr=1e-4 invariati.
+
+| Arm | Recall (n=20, single-fact) |
+|---|---|
+| text_only (baseline) | 85% |
+| embed_prefix (non addestrato) | 0% |
+| **embed_prefix (addestrato)** | **75%** ✅ **PASS** |
+
+Loss ora **liscia e monotona**: 6.55 → 1.95 → 0.78 → 0.17 → 0.13 → 0.27 (spariti gli swing 0.036↔5.7 del batch=1). La diagnosi era corretta: l'interferenza cross-memoria era da batch=1; il batching l'ha risolta (**25% → 75%**).
+
+**Prompt audit (apples-to-apples):** i due arm differiscono solo per il blocco system (memoria testo) vs prefisso latente. `enable_thinking=False` funziona: il template inserisce un blocco think **vuoto** (`<think>\n\n</think>`) → niente reasoning, risposta diretta. I `</think>` nei tail di Run 1 erano degenerazione cosmetica, confermato.
+
+**Esito tesi:** un backbone **frozen** legge un prefisso di memoria **puramente latente** (zero testo nel prompt) e raggiunge **75% vs 85%** del text prefix, con un bridge di 32.8M param (0.7%). È il **primo** approccio di injection architetturale che funziona qui, dopo 7 fallimenti (KV=0%, HS=loop). Gap residuo ~10 punti: probabili margini da più update / K-sweep / aux loss sui casi close-numeric.
+
 ## Rischi noti
 
 - Qwen3.5 è post-cutoff: serve `transformers` recente, possibile `trust_remote_code`. Verificare classe di load (CausalLM vs VLM) sul box.
