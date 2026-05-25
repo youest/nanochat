@@ -104,7 +104,13 @@ Loss ora **liscia e monotona**: 6.55 → 1.95 → 0.78 → 0.17 → 0.13 → 0.2
 
 **Prompt audit (apples-to-apples):** i due arm differiscono solo per il blocco system (memoria testo) vs prefisso latente. `enable_thinking=False` funziona: il template inserisce un blocco think **vuoto** (`<think>\n\n</think>`) → niente reasoning, risposta diretta. I `</think>` nei tail di Run 1 erano degenerazione cosmetica, confermato.
 
-**Esito tesi:** un backbone **frozen** legge un prefisso di memoria **puramente latente** (zero testo nel prompt) e raggiunge **75% vs 85%** del text prefix, con un bridge di 32.8M param (0.7%). È il **primo** approccio di injection architetturale che funziona qui, dopo 7 fallimenti (KV=0%, HS=loop). Gap residuo ~10 punti: probabili margini da più update / K-sweep / aux loss sui casi close-numeric.
+**Esito tesi:** un backbone **frozen** legge un prefisso di memoria **puramente latente** (zero testo nel prompt) e raggiunge **75% vs 85%** del text prefix, con un bridge di 32.8M param (0.7%). È il **primo** approccio di injection architetturale che funziona qui, dopo 7 fallimenti (KV=0%, HS=loop).
+
+⚠️ **Caveat — eval = train set.** `build_dataset()` produce 48 item e l'eval gira su `data[:20]`, gli **stessi** item su cui si addestra. Quindi il 75% misura se il bridge impara a **codificare memorie viste**, NON la generalizzazione a memorie nuove. Per il *mechanism claim* (frozen backbone legge il latente addestrato: 0%→75% vs 7 fallimenti) questo basta. Per qualsiasi claim oltre (sistema di memoria reale, building block v4) serve uno split held-out (es. 36 train / 12 test, riaddestrare).
+
+📊 **Banda di rumore.** 75% = 15/20, σ≈10pp (Bernoulli, n=20) → vero tasso ~65-85%. text_only 85% ha la stessa banda. Il gap di ~10 punti è **dentro il rumore**: i due potrebbero essere statisticamente indistinguibili. Non inseguire il gap con altra eval senza prima alzare n o fare lo split.
+
+**Gap/headroom (se si vuole spingere):** più update, K-sweep {4,8,16,32} (K=4 funzionante → storia di compressione), aux loss di ricostruzione sui casi close-numeric — ma prima di tutto: **split held-out** per separare memorizzazione da generalizzazione.
 
 ## Rischi noti
 
