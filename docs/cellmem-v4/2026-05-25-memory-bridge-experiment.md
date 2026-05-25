@@ -66,6 +66,30 @@ Diretto su GPU (Vast, `gpus:` nel YAML). Modello piccolo → GPU 24-48GB. TDD un
 
 Non distruggere il cluster a fine run. Push su remote `fork`.
 
+## Risultati
+
+### Run 1 — Qwen3.5-4B, K=16, 400 step, batch=1 (2026-05-25)
+
+Smoke OK (torch 2.9.1+cu126; `generate(inputs_embeds)` ritorna solo i token nuovi → decode corretto). Qwen3.5-4B carica su `transformers 5.9.0` con fallback torch del DeltaNet (niente kernel speciali).
+
+| Arm | Recall (n=20, single-fact) |
+|---|---|
+| text_only (baseline) | **85%** (riprodotto anche su 3.5-4B) |
+| embed_prefix (bridge **non** addestrato) | 0% |
+| embed_prefix (bridge addestrato) | **25%** |
+
+**Questo è il finding:** primo risultato non-zero e non-degenerato di injection latente su backbone **frozen**, dopo 7 tentativi architetturali che facevano 0% (KV) o loop (HS). Il backbone frozen *legge* un prefisso latente addestrato e produce risposte on-topic e nel formato giusto (diverse esatte).
+
+**Diagnosi (dal log, zero GPU):** classificazione dei 20 esiti →
+- 5 esatti (25%), 2 close-numeric (852/847, March 12/14 → lossy),
+- **13 wrong-entity/interferenza**: le risposte sbagliate prendono valori da *altre* memorie (Amara Osei, Yuki, Tanaka, Alex/Jack/Marco) → firma del **batch=1 catastrophic forgetting**.
+
+Loss: 11.7 → ~0.13 ma rumorosissima (0.036 ↔ 5.7): il bridge ha la *capacità* di guidare la risposta esatta su singoli esempi (loss→0.03), ma con batch=1 fitta l'esempio N e disfa N-1. Poiché l'eval è sugli stessi dati di training, 25% = train recall → non fitta in modo affidabile nemmeno il visto.
+
+`</think>`/`</w>` nei tail di embed_prefix: cosmetici per lo scoring (la risposta appare *prima*), non mangiano il budget.
+
+**Conclusione:** la leva è il **batching** (gradient accumulation), non l'aux loss di ricostruzione (giustificato solo se, batchando, restiamo sotto ~35%). Prossima run: K=16, LM-loss invariata, **una sola** modifica = grad accumulation.
+
 ## Rischi noti
 
 - Qwen3.5 è post-cutoff: serve `transformers` recente, possibile `trust_remote_code`. Verificare classe di load (CausalLM vs VLM) sul box.

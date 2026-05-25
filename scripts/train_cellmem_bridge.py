@@ -191,20 +191,31 @@ class BridgeTrainer:
 # ---------------------------------------------------------------------------
 
 def train(tr: BridgeTrainer, data: list[dict], steps: int, lr: float,
-          device: str) -> None:
+          device: str, accum: int = 8) -> None:
+    """Train the bridge with gradient accumulation.
+
+    Run 1 used batch=1 and showed catastrophic interference (answers borrowed
+    from other memories). Accumulating grads over `accum` items before each
+    optimizer step averages those competing gradients, which is the fix for
+    batch-1 forgetting. We backward per item (freeing each graph) so we never
+    hold `accum` copies of the 4B model's activation graph at once.
+    """
     import random
     opt = torch.optim.AdamW(tr.bridge.parameters(), lr=lr)
     tr.bridge.train()
     for step in range(steps):
-        item = random.choice(data)
-        with maybe_autocast(device):
-            loss = tr.bridge_loss(item)
         opt.zero_grad()
-        loss.backward()
+        running = 0.0
+        for _ in range(accum):
+            item = random.choice(data)
+            with maybe_autocast(device):
+                loss = tr.bridge_loss(item)
+            (loss / accum).backward()
+            running += loss.item()
         torch.nn.utils.clip_grad_norm_(tr.bridge.parameters(), 1.0)
         opt.step()
         if step % 25 == 0 or step == steps - 1:
-            print(f"  step {step:4d}  loss {loss.item():.4f}")
+            print(f"  step {step:4d}  loss {running / accum:.4f}")
     tr.bridge.train(False)
 
 
@@ -263,7 +274,10 @@ def main() -> None:
     ap.add_argument("--model", default="Qwen/Qwen3.5-4B")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--k-gist", type=int, default=16)
-    ap.add_argument("--steps", type=int, default=400)
+    ap.add_argument("--steps", type=int, default=150,
+                    help="optimizer updates (each averages --accum items)")
+    ap.add_argument("--accum", type=int, default=8,
+                    help="gradient accumulation: items averaged per update")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--eval-n", type=int, default=20)
     ap.add_argument("--out", default="/tmp/bridge_ckpt")
@@ -288,14 +302,21 @@ def main() -> None:
     n_params = sum(p.numel() for p in tr.bridge.parameters())
     print(f"MemoryBridge trainable params: {n_params:,} (backbone frozen)")
 
+    # Apples-to-apples check: the two arms must differ only by how memory is
+    # injected (system text vs latent prefix), not by thinking-mode scaffolding.
+    print("\n[prompt audit for data[0]]")
+    print(f"  text_only  prompt: {tr._text_prompt(data[0]['query'], data[0]['memory'])!r}")
+    print(f"  embed arm  prompt: {tr._query_prompt(data[0]['query'])!r}")
+
     print("\n[baseline before training]")
     base_text = tr.score_recall(data, "text_only", n=args.eval_n)
     base_embed = tr.score_recall(data, "embed_prefix", n=args.eval_n)
     print(f"  text_only    = {base_text:.2%}")
     print(f"  embed_prefix = {base_embed:.2%} (untrained bridge)")
 
-    print(f"\n[training bridge: {args.steps} steps, lr={args.lr}]")
-    train(tr, data, steps=args.steps, lr=args.lr, device=args.device)
+    print(f"\n[training bridge: {args.steps} updates x accum {args.accum} "
+          f"= {args.steps * args.accum} item-forwards, lr={args.lr}]")
+    train(tr, data, steps=args.steps, lr=args.lr, device=args.device, accum=args.accum)
 
     print("\n[eval after training]")
     text = tr.score_recall(data, "text_only", n=args.eval_n, debug=True)

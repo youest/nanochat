@@ -15,7 +15,8 @@ resources:
 envs:
   MODEL: "Qwen/Qwen3.5-4B"
   K_GIST: "16"
-  STEPS: "400"
+  STEPS: "150"      # optimizer updates
+  ACCUM: "8"        # grad accumulation (fix for run-1 batch=1 interference)
   LR: "1e-4"
   EVAL_N: "20"
 
@@ -70,6 +71,7 @@ run: |
     --device cuda \
     --k-gist "$K_GIST" \
     --steps "$STEPS" \
+    --accum "$ACCUM" \
     --lr "$LR" \
     --eval-n "$EVAL_N" \
     --trust-remote-code \
