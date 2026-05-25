@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CellMem — Mappa delle tecniche di injection</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --txt:#e6edf3; --muted:#8b949e;
+    --green:#3fb950; --red:#f85149; --yellow:#d29922; --blue:#58a6ff; --orange:#db6d28;
+    --dim:#21262d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg);color:var(--txt);line-height:1.5;padding:24px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:14px;margin-bottom:20px}
+  .layout{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:24px;align-items:start}
+  @media(max-width:900px){.layout{grid-template-columns:1fr}}
+
+  .spectrum{position:relative;margin:0 0 26px;padding:18px 14px 14px;background:var(--panel);
+    border:1px solid var(--border);border-radius:10px}
+  .spectrum .bar{height:8px;border-radius:4px;
+    background:linear-gradient(90deg,var(--green),var(--blue),var(--yellow),var(--red));margin:8px 6px 0}
+  .spectrum .ends{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-top:8px;padding:0 4px}
+
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px}
+  .chip{cursor:pointer;border:1px solid var(--border);background:var(--dim);border-radius:20px;
+    padding:7px 14px;font-size:13px;display:flex;align-items:center;gap:8px;transition:.15s;user-select:none}
+  .chip:hover{border-color:var(--blue);transform:translateY(-1px)}
+  .chip.active{border-color:var(--blue);background:#1f2a3d;box-shadow:0 0 0 1px var(--blue)}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+  .g{background:var(--green)} .r{background:var(--red)} .y{background:var(--yellow)}
+  .b{background:var(--blue)} .o{background:var(--orange)}
+
+  .stack{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px}
+  .lane{position:relative;margin:0 0 10px}
+  .box{border:1px solid var(--border);border-radius:8px;padding:12px 14px;background:var(--dim);
+    transition:.2s;position:relative}
+  .box .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .box .name{font-size:14px;font-weight:600;margin-top:2px}
+  .box.hot{border-color:var(--blue);background:#16263b;box-shadow:0 0 0 2px var(--blue) inset}
+  .arrow{text-align:center;color:var(--muted);font-size:14px;margin:2px 0}
+  .attn{border:1px dashed var(--border);border-radius:8px;padding:10px;margin-top:10px;background:#10151c}
+  .attn .title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+  .sub-box{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin:6px 0;background:var(--dim);
+    font-size:13px;transition:.2s;position:relative}
+  .sub-box.hot{border-color:var(--blue);background:#16263b;box-shadow:0 0 0 2px var(--blue) inset}
+  .marker{position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:11px;
+    border-radius:12px;padding:2px 9px;font-weight:700;opacity:0;transition:.2s;pointer-events:none}
+  .marker.show{opacity:1}
+
+  .detail{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;position:sticky;top:20px}
+  .detail h2{font-size:16px;margin:0 0 2px;display:flex;align-items:center;gap:8px}
+  .badge{font-size:12px;font-weight:700;padding:2px 10px;border-radius:12px;margin-left:auto}
+  .badge.g{background:rgba(63,185,80,.15);color:var(--green)}
+  .badge.r{background:rgba(248,81,73,.15);color:var(--red)}
+  .badge.y{background:rgba(210,153,34,.15);color:var(--yellow)}
+  .badge.b{background:rgba(88,166,255,.15);color:var(--blue)}
+  .badge.o{background:rgba(219,109,40,.15);color:var(--orange)}
+  .where{font-size:12px;color:var(--muted);margin:6px 0 14px}
+  .meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+  .meta span{font-size:11px;background:var(--dim);border:1px solid var(--border);border-radius:6px;padding:3px 8px;color:var(--muted)}
+  .pc{margin-bottom:12px}
+  .pc .h{font-size:12px;font-weight:700;margin-bottom:5px}
+  .pc.pro .h{color:var(--green)} .pc.con .h{color:var(--red)}
+  .pc ul{margin:0;padding-left:18px;font-size:13px}
+  .pc li{margin:3px 0}
+  .hint{color:var(--muted);font-size:13px;font-style:italic}
+  .legend{margin-top:18px;font-size:12px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:5px;margin-right:14px}
+</style>
+</head>
+<body>
+  <h1>CellMem — dove interviene ogni tecnica di memoria</h1>
+  <div class="sub">Clicca una tecnica → si illumina il punto esatto nel transformer. Concetto chiave: più scendi nel modello, più la memoria è "architettura" — ma un backbone <b>frozen</b> sa leggere solo ciò che è vicino alla sua distribuzione.</div>
+
+  <div class="spectrum">
+    <div style="font-size:12px;color:var(--muted);margin-bottom:2px">Profondità di intervento</div>
+    <div class="bar"></div>
+    <div class="ends">
+      <span>◄ ESTERNO &nbsp;·&nbsp; facile, ma è RAG &nbsp;·&nbsp; testo</span>
+      <span>INTERNO ►&nbsp;·&nbsp; potente, ma serve training &nbsp;·&nbsp; attention</span>
+    </div>
+  </div>
+
+  <div class="chips" id="chips"></div>
+
+  <div class="layout">
+    <div class="stack">
+      <div class="lane">
+        <div class="box" data-zone="prompt">
+          <div class="lab">testo / prompt</div>
+          <div class="name">Utente + memoria recuperata come TESTO</div>
+          <div class="marker" data-zone="prompt"></div>
+        </div>
+      </div>
+      <div class="arrow">▼</div>
+      <div class="lane">
+        <div class="box"><div class="lab">tokenizer</div><div class="name">Tokenizer</div></div>
+      </div>
+      <div class="arrow">▼</div>
+      <div class="lane">
+        <div class="box" data-zone="embed">
+          <div class="lab">input embeddings</div>
+          <div class="name">Input Embeddings &nbsp;·&nbsp; ← prefix LATENTE iniettabile qui</div>
+          <div class="marker" data-zone="embed"></div>
+        </div>
+      </div>
+      <div class="arrow">▼</div>
+      <div class="lane">
+        <div class="box" data-zone="layers">
+          <div class="lab">decoder layers 0 … L … N</div>
+          <div class="name">Stack dei decoder &nbsp;·&nbsp; ← concat hidden states TRA i layer</div>
+          <div class="marker" data-zone="layers"></div>
+          <div class="attn">
+            <div class="title">dentro ogni layer (zoom sui layer alti)</div>
+            <div class="sub-box">q_proj / k_proj / v_proj &nbsp;→&nbsp; q_norm / k_norm &nbsp;→&nbsp; RoPE</div>
+            <div class="sub-box" data-zone="kv">
+              KV cache &nbsp;·&nbsp; ← iniezione K/V esterni
+              <div class="marker" data-zone="kv"></div>
+            </div>
+            <div class="sub-box" data-zone="attn">
+              attention &nbsp;·&nbsp; ← sparse attn su memoria compressa
+              <div class="marker" data-zone="attn"></div>
+            </div>
+            <div class="sub-box">MLP</div>
+          </div>
+        </div>
+      </div>
+      <div class="arrow">▼</div>
+      <div class="lane">
+        <div class="box"><div class="lab">output</div><div class="name">Logits → testo</div></div>
+      </div>
+    </div>
+
+    <div class="detail" id="detail">
+      <p class="hint">Seleziona una tecnica qui sopra per vedere dove interviene, e i suoi pro/contro.</p>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="dot g"></i> funziona</span>
+    <span><i class="dot b"></i> da testare</span>
+    <span><i class="dot y"></i> parziale / instabile</span>
+    <span><i class="dot r"></i> fallito</span>
+    <span><i class="dot o"></i> funziona ma fuori portata</span>
+  </div>
+
+<script>
+const TECH = [
+  { id:1, name:"Text prefix", color:"g", badge:"85% ✅", zone:["prompt"],
+    where:"Interviene al livello del PROMPT (testo), prima della tokenizzazione.",
+    meta:["backbone: frozen","training: nessuno","fonte: nostro baseline"],
+    pro:["Funziona: 85% generation_recall","Zero training","Recall esatto di nomi/fatti"],
+    con:["È RAG, non è 'dentro' l'architettura","Consuma context window","Non scala a milioni di token"] },
+  { id:5, name:"RecursiveMAS / 500xCompressor", color:"b", badge:"da testare", zone:["embed"],
+    where:"Interviene a livello di INPUT EMBEDDINGS: prefix latente proiettato da un bridge addestrato.",
+    meta:["backbone: frozen","training: bridge 13M (0.31%)","fonte: arXiv 2604.25917"],
+    pro:["Injection 'gentile' vicino alla distribuzione","Costo minimo (~13M params, backbone frozen)","Loss in-distribution (cos sim verso embedding del modello) attacca il problema OOD","Comprime → può scalare oltre il context window"],
+    con:["La compressione perde informazione","Da validare: batte davvero l'85% del text prefix?","Mai testato da noi su recall esatto"] },
+  { id:3, name:"HS injection (MemoryLLM)", color:"y", badge:"80% → loop ⚠️", zone:["layers"],
+    where:"Interviene TRA i decoder layer: concatena hidden states all'ingresso di un layer L.",
+    meta:["backbone: frozen + LoRA","training: LoRA","fonte: Attempt 4-7"],
+    pro:["Il backbone 'vede' la memoria nel residual stream","80% in eval offline"],
+    con:["Richiede LoRA sul backbone","Instabile: degenera in loop generativi in chat","Recall in eval ≠ qualità in conversazione reale"] },
+  { id:2, name:"KV injection + Parallel RoPE", color:"r", badge:"0% ❌", zone:["kv"],
+    where:"Interviene nel KV CACHE dei layer alti: inserisce K/V di memoria (con k_norm + RoPE).",
+    meta:["backbone: frozen","training: nessuno","fonte: Attempt 1 (f069f28)"],
+    pro:["Concettualmente elegante: memoria = KV come il contesto","Nessun training richiesto"],
+    con:["q_proj frozen IGNORA K/V out-of-distribution → 0%","La query non sa 'guardare' verso i K/V iniettati","exp(0)=1 dilution nell'ibrido testo+KV (75%, peggio dell'85%)"] },
+  { id:4, name:"MSA (Memory Sparse Attention)", color:"o", badge:"+37% ma 158B tok", zone:["attn","kv"],
+    where:"Interviene nell'ATTENTION dei layer 9-18: sparse attention (top-k) su chunk di memoria compressi.",
+    meta:["backbone: RI-ADDESTRATO","training: 158.95B token","fonte: arXiv 2603.23516"],
+    pro:["+37.1% recall con re-injection","Scala fino a 100M token in inferenza","Parallel RoPE + InfoNCE aux loss"],
+    con:["Richiede continual pre-training su 158B token","Fuori dalla nostra portata di budget/GPU","Senza quel training il backbone frozen non legge la memoria (= il nostro Attempt 1)"] },
+];
+
+function el(tag, cls, txt){
+  const e = document.createElement(tag);
+  if(cls) e.className = cls;
+  if(txt != null) e.textContent = txt;
+  return e;
+}
+
+const chips = document.getElementById('chips');
+const detail = document.getElementById('detail');
+
+TECH.forEach(t=>{
+  const c = el('div','chip');
+  c.dataset.id = t.id;
+  c.appendChild(el('i','dot '+t.color));
+  c.appendChild(el('b', null, t.id+'.'));
+  c.appendChild(document.createTextNode(' '+t.name));
+  c.onclick = ()=>select(t.id);
+  chips.appendChild(c);
+});
+
+function clearHot(){
+  document.querySelectorAll('.box,.sub-box').forEach(e=>e.classList.remove('hot'));
+  document.querySelectorAll('.marker').forEach(m=>{m.classList.remove('show');m.textContent='';m.style.background='';});
+  document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+}
+
+function select(id){
+  const t = TECH.find(x=>x.id===id);
+  clearHot();
+  document.querySelector('.chip[data-id="'+id+'"]').classList.add('active');
+  const colorVar = {g:'--green',r:'--red',y:'--yellow',b:'--blue',o:'--orange'}[t.color];
+  const colorVal = getComputedStyle(document.documentElement).getPropertyValue(colorVar);
+  t.zone.forEach(z=>{
+    document.querySelectorAll('[data-zone="'+z+'"]').forEach(elm=>{
+      if(elm.classList.contains('marker')){
+        elm.classList.add('show');
+        elm.textContent = '◄ '+t.id;
+        elm.style.background = colorVal;
+        elm.style.color = '#0d1117';
+      } else {
+        elm.classList.add('hot');
+      }
+    });
+  });
+
+  detail.textContent = '';
+  const h2 = el('h2', null, t.id+'. '+t.name);
+  h2.appendChild(el('span','badge '+t.color, t.badge));
+  detail.appendChild(h2);
+  detail.appendChild(el('div','where', t.where));
+
+  const meta = el('div','meta');
+  t.meta.forEach(m=>meta.appendChild(el('span', null, m)));
+  detail.appendChild(meta);
+
+  const pro = el('div','pc pro');
+  pro.appendChild(el('div','h','▲ PRO'));
+  const ulp = el('ul');
+  t.pro.forEach(p=>ulp.appendChild(el('li', null, p)));
+  pro.appendChild(ulp);
+  detail.appendChild(pro);
+
+  const con = el('div','pc con');
+  con.appendChild(el('div','h','▼ CONTRO'));
+  const ulc = el('ul');
+  t.con.forEach(c=>ulc.appendChild(el('li', null, c)));
+  con.appendChild(ulc);
+  detail.appendChild(con);
+}
+
+select(1);
+</script>
+</body>
+</html>
