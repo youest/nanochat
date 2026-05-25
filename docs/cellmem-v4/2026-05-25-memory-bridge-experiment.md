@@ -112,6 +112,28 @@ Loss ora **liscia e monotona**: 6.55 → 1.95 → 0.78 → 0.17 → 0.13 → 0.2
 
 **Gap/headroom (se si vuole spingere):** più update, K-sweep {4,8,16,32} (K=4 funzionante → storia di compressione), aux loss di ricostruzione sui casi close-numeric — ma prima di tutto: **split held-out** per separare memorizzazione da generalizzazione.
 
+### Run 3 — split held-out 36 train / 12 test UNSEEN (2026-05-25) ❌
+
+Unica modifica vs Run 2: `--holdout 12` (split deterministico seed 0). Addestro su 36 memorie, valuto `embed_prefix` su 12 memorie **mai viste**.
+
+| Arm | Recall |
+|---|---|
+| text_only (test, training-free) | 75% (controllo; n=12, l'85% scende per varianza del piccolo split) |
+| embed_prefix (**train**, seen) | **95%** |
+| embed_prefix (**test**, UNSEEN) | **0%** |
+| train-test gap | **+95% → MEMORIZZAZIONE** |
+
+**Il risultato è inequivocabile: il bridge ha MEMORIZZATO le coppie di training, non ha imparato un encoder di memoria generale.** Su memorie nuove fa 0%: ignora il latente della memoria di test ed emette valori presi dalla *distribuzione di training* — "Where do I live?"→"Milan" (training: "born in Milan"), "travel?"→"Paris" (training: "bakery in Paris"), "name?"→"Jack", "work?"→"Faircode" (corruzione di "Fairmind"). Il latente delle memorie non viste non porta informazione utilizzabile.
+
+**Questo falsifica la tesi per la generalizzazione.** Il "successo" di Run 2 (75%/train-set) era **memorizzazione**, non un meccanismo di memoria funzionante — esattamente ciò che l'eval-on-train mascherava (l'advisor aveva ragione a marcarlo bloccante).
+
+## Bottom line (rivisto)
+
+- ✅ **Mechanism (debole):** un backbone frozen *può* essere pilotato da un prefisso latente addestrato (0%→95% su memorie viste). Non è morto come KV/HS.
+- ❌ **Memoria (lo scopo vero):** NON generalizza a memorie nuove (0% su unseen). Con K=16 e **solo 36 memorie** il bridge memorizza coppie, non impara a *codificare testo arbitrario* in gist leggibile.
+- **Ipotesi dominante:** troppo pochi dati. Gli encoder di compressione che funzionano (ICAE, AutoCompressor, 500xCompressor) si addestrano su **corpora enormi e diversi**, non 36 esempi. Prossimo test possibile: generare migliaia di coppie (memory, query, answer) sintetiche e diverse, poi rivalutare l'held-out. È un esperimento molto più grande.
+- **Per ora:** il text prefix (85%) resta l'unico approccio che funziona davvero come memoria. L'injection latente è promettente come *meccanismo* ma non dimostrata come *memoria* a questa scala di dati.
+
 ## Rischi noti
 
 - Qwen3.5 è post-cutoff: serve `transformers` recente, possibile `trust_remote_code`. Verificare classe di load (CausalLM vs VLM) sul box.
