@@ -33,21 +33,24 @@ setup: |
   uv sync --extra gpu
 
   source .venv/bin/activate
-  python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
-    echo "Reinstalling torch for cu126..."
-    uv pip install --reinstall torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
-  }
 
   # Qwen3.5 is post-cutoff: needs a recent transformers (hybrid Gated-DeltaNet).
-  # Bump to latest; if the architecture needs linear-attention kernels the smoke
-  # step below will surface it (then: uv pip install flash-linear-attention causal-conv1d).
+  # torch-fallback DeltaNet works without flash-linear-attention/causal-conv1d.
   uv pip install -U transformers accelerate
+
+  # The transformers upgrade can pull a torch built for a CUDA newer than the
+  # box driver (we hit "driver too old, found 12090" = CUDA 12.9 driver vs a
+  # cu13x torch). Re-pin torch to cu126 LAST so it matches the driver
+  # (memory: cu126 fix). Then verify a REAL cuda op, not just is_available().
+  uv pip install --reinstall torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126
+  python -c "import torch; x=torch.zeros(1).cuda(); print('CUDA op OK; torch', torch.__version__, 'cuda', torch.version.cuda)"
 
   # Pre-download model (trust_remote_code in case modeling code ships on the Hub).
   python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; import torch; AutoTokenizer.from_pretrained('$MODEL', trust_remote_code=True); AutoModelForCausalLM.from_pretrained('$MODEL', dtype=torch.bfloat16, trust_remote_code=True); print('Model ready.')"
 
 run: |
   set -e
+  set -o pipefail   # so `python ... | tee` failures propagate (smoke gates training)
   cd ~/nanochat
   source .venv/bin/activate
   export OMP_NUM_THREADS=1
