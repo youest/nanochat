@@ -131,7 +131,11 @@ Unica modifica vs Run 2: `--holdout 12` (split deterministico seed 0). Addestro 
 
 - ✅ **Mechanism (debole):** un backbone frozen *può* essere pilotato da un prefisso latente addestrato (0%→95% su memorie viste). Non è morto come KV/HS.
 - ❌ **Memoria (lo scopo vero):** NON generalizza a memorie nuove (0% su unseen). Con K=16 e **solo 36 memorie** il bridge memorizza coppie, non impara a *codificare testo arbitrario* in gist leggibile.
-- **Ipotesi dominante:** troppo pochi dati. Gli encoder di compressione che funzionano (ICAE, AutoCompressor, 500xCompressor) si addestrano su **corpora enormi e diversi**, non 36 esempi. Prossimo test possibile: generare migliaia di coppie (memory, query, answer) sintetiche e diverse, poi rivalutare l'held-out. È un esperimento molto più grande.
+- **Forma del fallimento (informativa):** gli errori su test NON sono allucinazioni nuove condizionate sulla memoria di test — sono **valori presi dalla distribuzione di training** (Milan/Paris/Jack/"Faircode"). Cioè il bridge ha imparato un *lookup/classificatore a 36 vie* sulle risposte di training, **ignorando** la memoria di test, non una mappatura memoria→latente.
+- **Due ipotesi, entrambe NON dimostrate da questo run:**
+  - *(scala)* troppo pochi dati — encoder di compressione reali (ICAE, AutoCompressor, 500xCompressor) si addestrano su corpora enormi e diversi, non 36 esempi. Test: migliaia di triple sintetiche diverse, poi held-out.
+  - *(capacità)* K=16 gist token attraverso attivazioni DeltaNet frozen potrebbe **non poter** formare un encoder di testo arbitrario, a prescindere dai dati. Test: K=64/256.
+  - Nessuna delle due è implicata dall'evidenza attuale; non danno per scontato che la run "big-data" riesca.
 - **Per ora:** il text prefix (85%) resta l'unico approccio che funziona davvero come memoria. L'injection latente è promettente come *meccanismo* ma non dimostrata come *memoria* a questa scala di dati.
 
 ## Rischi noti
