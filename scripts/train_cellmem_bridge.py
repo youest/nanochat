@@ -280,6 +280,9 @@ def main() -> None:
                     help="gradient accumulation: items averaged per update")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--eval-n", type=int, default=20)
+    ap.add_argument("--holdout", type=int, default=0,
+                    help="if >0, hold out this many items for a test split "
+                         "(train on the rest, eval embed_prefix on UNSEEN items)")
     ap.add_argument("--out", default="/tmp/bridge_ckpt")
     ap.add_argument("--smoke", action="store_true",
                     help="load verification only, then exit")
@@ -298,6 +301,18 @@ def main() -> None:
         return
 
     data = build_dataset()
+    if args.holdout > 0:
+        import random as _r
+        shuffled = data[:]
+        _r.Random(0).shuffle(shuffled)               # deterministic split
+        test_data = shuffled[:args.holdout]
+        train_data = shuffled[args.holdout:]
+        print(f"Held-out split: {len(train_data)} train / {len(test_data)} test (UNSEEN)")
+    else:
+        train_data = data
+        test_data = data[:args.eval_n]
+        print("No held-out split: eval on training data (mechanism test only)")
+
     tr = BridgeTrainer(model, tok, k_gist=args.k_gist, device=args.device)
     n_params = sum(p.numel() for p in tr.bridge.parameters())
     print(f"MemoryBridge trainable params: {n_params:,} (backbone frozen)")
@@ -308,24 +323,37 @@ def main() -> None:
     print(f"  text_only  prompt: {tr._text_prompt(data[0]['query'], data[0]['memory'])!r}")
     print(f"  embed arm  prompt: {tr._query_prompt(data[0]['query'])!r}")
 
-    print("\n[baseline before training]")
-    base_text = tr.score_recall(data, "text_only", n=args.eval_n)
-    base_embed = tr.score_recall(data, "embed_prefix", n=args.eval_n)
+    n_test = len(test_data)
+    n_train_eval = min(args.eval_n, len(train_data))
+
+    print(f"\n[baseline before training, eval on {n_test} test items]")
+    base_text = tr.score_recall(test_data, "text_only", n=n_test)
+    base_embed = tr.score_recall(test_data, "embed_prefix", n=n_test)
     print(f"  text_only    = {base_text:.2%}")
     print(f"  embed_prefix = {base_embed:.2%} (untrained bridge)")
 
-    print(f"\n[training bridge: {args.steps} updates x accum {args.accum} "
-          f"= {args.steps * args.accum} item-forwards, lr={args.lr}]")
-    train(tr, data, steps=args.steps, lr=args.lr, device=args.device, accum=args.accum)
+    print(f"\n[training bridge on {len(train_data)} items: {args.steps} updates "
+          f"x accum {args.accum} = {args.steps * args.accum} item-forwards, lr={args.lr}]")
+    train(tr, train_data, steps=args.steps, lr=args.lr, device=args.device, accum=args.accum)
 
-    print("\n[eval after training]")
-    text = tr.score_recall(data, "text_only", n=args.eval_n, debug=True)
-    embed = tr.score_recall(data, "embed_prefix", n=args.eval_n, debug=True)
-    print(f"\n=== RESULT (K={args.k_gist}) ===")
-    print(f"  text_only    = {text:.2%}  (baseline)")
-    print(f"  embed_prefix = {embed:.2%}  (thesis: should match text_only)")
-    verdict = "PASS" if embed >= 0.75 else "FAIL"
-    print(f"  thesis (embed_prefix >= 75%): {verdict}")
+    print(f"\n[eval after training — TEST (unseen) n={n_test}]")
+    text = tr.score_recall(test_data, "text_only", n=n_test, debug=True)
+    embed_test = tr.score_recall(test_data, "embed_prefix", n=n_test, debug=True)
+    embed_train = None
+    if args.holdout > 0:
+        print(f"\n[eval after training — TRAIN (seen) n={n_train_eval}]")
+        embed_train = tr.score_recall(train_data, "embed_prefix", n=n_train_eval)
+
+    print(f"\n=== RESULT (K={args.k_gist}, holdout={args.holdout}) ===")
+    print(f"  text_only     (test)  = {text:.2%}  (baseline, training-free)")
+    print(f"  embed_prefix  (test)  = {embed_test:.2%}  (GENERALIZATION to unseen memories)")
+    if embed_train is not None:
+        print(f"  embed_prefix  (train) = {embed_train:.2%}  (seen memories)")
+        gap = embed_train - embed_test
+        print(f"  train-test gap        = {gap:+.2%}  "
+              f"({'memorization' if gap > 0.25 else 'generalizes'})")
+    verdict = "PASS" if embed_test >= 0.60 else "FAIL"
+    print(f"  generalization (embed_prefix test >= 60%): {verdict}")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

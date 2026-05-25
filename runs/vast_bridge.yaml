@@ -19,6 +19,7 @@ envs:
   ACCUM: "8"        # grad accumulation (fix for run-1 batch=1 interference)
   LR: "1e-4"
   EVAL_N: "20"
+  HOLDOUT: "12"    # held-out test items (train on the other 36, eval on unseen)
 
 setup: |
   git clone https://github.com/youest/nanochat.git ~/nanochat 2>/dev/null || \
@@ -74,6 +75,7 @@ run: |
     --accum "$ACCUM" \
     --lr "$LR" \
     --eval-n "$EVAL_N" \
+    --holdout "$HOLDOUT" \
     --trust-remote-code \
     --out /tmp/bridge_ckpt \
     2>&1 | tee /tmp/bridge_train.log
